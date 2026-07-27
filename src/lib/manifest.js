@@ -1,4 +1,4 @@
-code // Parses the upload manifest: seg_coco.json — COCO instance-segmentation
+// Parses the upload manifest: seg_coco.json — COCO instance-segmentation
 // JSON (images[], annotations[], categories[]), confirmed against a real
 // sample. Each annotation carries its own `mask_path` (e.g.
 // "masks/3K0347OTHSV2018_3430_ann1.png"), so matching a mask FILE to its
