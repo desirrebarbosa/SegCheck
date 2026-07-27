@@ -1,30 +1,61 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
+import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { supabase } from './lib/supabaseClient'
+import { useSession } from './auth/useSession'
+import Login from './pages/Login'
+import ProjectsList from './pages/ProjectsList'
+import ProjectLayout from './components/ProjectLayout'
+import ReviewQueue from './pages/ReviewQueue'
+import Upload from './pages/Upload'
+import Fix from './pages/Fix'
+import Dashboard from './pages/Dashboard'
+import Members from './pages/Members'
 
-// Bit 1 smoke test: prove the React app can reach Supabase.
-// It asks the DB for the row count of `reviewers` (created in Bit 2).
+// Make sure a row exists in `reviewers` for the logged-in user, and keep the
+// email current (the email is how leads add this person to a project).
+async function ensureReviewer(user) {
+  await supabase.from('reviewers').upsert(
+    {
+      id: user.id,
+      email: user.email?.toLowerCase(),
+      display_name: user.email,
+    },
+    { onConflict: 'id' },
+  )
+}
+
 export default function App() {
-  const [status, setStatus] = useState('checking…')
+  const session = useSession()
 
   useEffect(() => {
-    supabase
-      .from('reviewers')
-      .select('*', { count: 'exact', head: true })
-      .then(({ error, count }) => {
-        if (error) setStatus(`Connected, but query failed: ${error.message}`)
-        else setStatus(`Connected to Supabase ✓  (reviewers rows: ${count})`)
-      })
-  }, [])
+    if (session?.user) ensureReviewer(session.user)
+  }, [session])
+
+  if (session === undefined) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-400">
+        Loading…
+      </div>
+    )
+  }
+
+  if (!session) return <Login />
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col items-center justify-center gap-3">
-      <h1 className="text-3xl font-bold">SegCheck</h1>
-      <p className="text-sm text-slate-500">
-        SAM mask QA against ground-truth bounding boxes
-      </p>
-      <span className="mt-2 rounded-full bg-white px-4 py-1 text-sm shadow">
-        {status}
-      </span>
-    </div>
+    <BrowserRouter>
+      <Routes>
+        {/* Landing: pick or create a project */}
+        <Route path="/" element={<ProjectsList session={session} />} />
+
+        {/* Everything inside a project is scoped by :projectId */}
+        <Route path="/projects/:projectId" element={<ProjectLayout session={session} />}>
+          <Route index element={<ReviewQueue />} />
+          <Route path="upload" element={<Upload />} />
+          <Route path="fix" element={<Fix />} />
+          <Route path="dashboard" element={<Dashboard />} />
+          <Route path="members" element={<Members />} />
+        </Route>
+      </Routes>
+    </BrowserRouter>
   )
 }
