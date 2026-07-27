@@ -29,7 +29,6 @@ export default function ProjectLayout({ session }) {
   const links = [
     { to: '', label: 'Review Queue', end: true },
     { to: 'upload', label: 'Upload' },
-    { to: 'fix', label: 'Fix' },
     { to: 'dashboard', label: 'Dashboard' },
     { to: 'members', label: 'Members' },
   ]

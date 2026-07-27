@@ -7,7 +7,6 @@ import ProjectsList from './pages/ProjectsList'
 import ProjectLayout from './components/ProjectLayout'
 import ReviewQueue from './pages/ReviewQueue'
 import Upload from './pages/Upload'
-import Fix from './pages/Fix'
 import Dashboard from './pages/Dashboard'
 import Members from './pages/Members'
 
@@ -51,7 +50,6 @@ export default function App() {
         <Route path="/projects/:projectId" element={<ProjectLayout session={session} />}>
           <Route index element={<ReviewQueue />} />
           <Route path="upload" element={<Upload />} />
-          <Route path="fix" element={<Fix />} />
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="members" element={<Members />} />
         </Route>
