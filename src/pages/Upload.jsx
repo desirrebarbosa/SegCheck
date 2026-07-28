@@ -2,14 +2,12 @@ import { useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { readZipEntries } from '../lib/zipHelpers'
-import { buildUploadPlan } from '../lib/manifest'
+import { classifyZipEntries, buildUploadPlan } from '../lib/manifest'
 import { commitUploadPlan } from '../lib/uploads'
 
 export default function Upload() {
   const { projectId } = useOutletContext()
-  const [photoZip, setPhotoZip] = useState(null)
-  const [maskZip, setMaskZip] = useState(null)
-  const [manifestFile, setManifestFile] = useState(null)
+  const [zipFile, setZipFile] = useState(null)
   const [plan, setPlan] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
@@ -20,17 +18,14 @@ export default function Upload() {
     setResult(null)
     setBusy(true)
     try {
-      if (!photoZip || !maskZip || !manifestFile) {
-        throw new Error('Pick a photos zip, a masks zip, and the manifest JSON.')
-      }
-      const [photoEntries, maskEntries, manifestText] = await Promise.all([
-        readZipEntries(photoZip),
-        readZipEntries(maskZip),
-        manifestFile.text(),
-      ])
-      const manifestJson = JSON.parse(manifestText)
-      const photoFiles = photoEntries.map((e) => ({ ...e, file: e.blob }))
-      const maskFiles = maskEntries.map((e) => ({ ...e, file: e.blob }))
+      if (!zipFile) throw new Error('Pick a dataset zip first.')
+
+      const entries = await readZipEntries(zipFile)
+      const { photoFiles, maskFiles, manifestJson } = await classifyZipEntries(entries)
+
+      if (photoFiles.length === 0) throw new Error('No files found under an images/ folder.')
+      if (maskFiles.length === 0) throw new Error('No files found under a masks/ folder.')
+
       setPlan(buildUploadPlan({ photoFiles, maskFiles, manifestJson }))
     } catch (e) {
       setError(e.message)
@@ -49,9 +44,7 @@ export default function Upload() {
       const summary = await commitUploadPlan({ projectId, userId: user.id, plan: plan.plan })
       setResult(summary)
       setPlan(null)
-      setPhotoZip(null)
-      setMaskZip(null)
-      setManifestFile(null)
+      setZipFile(null)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -68,20 +61,25 @@ export default function Upload() {
     <section className="max-w-2xl">
       <h2 className="text-xl font-semibold">Upload</h2>
       <p className="mt-1 text-sm text-slate-500">
-        Upload a photos zip, a masks zip, and the manifest (COCO-style instance JSON: images[],
-        annotations[], categories[]). Re-uploading a photo that already exists in this project
-        creates a new version — only the new masks go back into the review queue.
+        Upload one zip of a dataset split — it should contain an{' '}
+        <code>images/</code> folder, a <code>masks/</code> folder, and{' '}
+        <code>annotations/seg_coco.json</code>. Re-uploading a photo that already exists in this
+        project creates a new version — only the new masks go back into the review queue.
       </p>
 
-      <div className="mt-6 space-y-3">
-        <FilePicker label="Photos .zip" accept=".zip" file={photoZip} onChange={setPhotoZip} />
-        <FilePicker label="Masks .zip" accept=".zip" file={maskZip} onChange={setMaskZip} />
-        <FilePicker
-          label="Manifest .json"
-          accept=".json,application/json"
-          file={manifestFile}
-          onChange={setManifestFile}
-        />
+      <div className="mt-6">
+        <label className="flex items-center justify-between rounded border border-slate-300 px-3 py-2 text-sm">
+          <span className="text-slate-600">Dataset .zip</span>
+          <span className="flex items-center gap-2">
+            {zipFile && <span className="text-xs text-slate-400">{zipFile.name}</span>}
+            <input
+              type="file"
+              accept=".zip"
+              className="text-xs"
+              onChange={(e) => setZipFile(e.target.files[0] ?? null)}
+            />
+          </span>
+        </label>
       </div>
 
       <button
@@ -131,22 +129,5 @@ export default function Upload() {
         </p>
       )}
     </section>
-  )
-}
-
-function FilePicker({ label, accept, file, onChange }) {
-  return (
-    <label className="flex items-center justify-between rounded border border-slate-300 px-3 py-2 text-sm">
-      <span className="text-slate-600">{label}</span>
-      <span className="flex items-center gap-2">
-        {file && <span className="text-xs text-slate-400">{file.name}</span>}
-        <input
-          type="file"
-          accept={accept}
-          className="text-xs"
-          onChange={(e) => onChange(e.target.files[0] ?? null)}
-        />
-      </span>
-    </label>
   )
 }

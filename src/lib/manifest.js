@@ -11,6 +11,40 @@ function stem(path) {
   return base.replace(/\.[^.]+$/, '')
 }
 
+// True if `relativePath` sits inside a folder literally named `folderName`
+// at any depth — e.g. inFolder('jodd/val/images/foo.jpg', 'images') is true
+// regardless of the dataset/split prefix in front of it.
+function inFolder(relativePath, folderName) {
+  const parts = String(relativePath).split(/[\\/]/)
+  return parts.slice(0, -1).includes(folderName)
+}
+
+// Splits one uploaded dataset zip's flat entries (from readZipEntries) into
+// the three things a batch needs, based on the real layout you showed me:
+//   <dataset>/<split>/images/...            -> photos
+//   <dataset>/<split>/masks/...             -> masks
+//   <dataset>/<split>/annotations/seg_coco.json -> the manifest (the
+//     SAM-assisted final annotation file — coco.json, if also present, is
+//     ignored on purpose per your earlier confirmation)
+// Throws a clear error if the manifest file isn't found, since there's
+// nothing sensible to fall back to.
+export async function classifyZipEntries(entries) {
+  const photoFiles = entries
+    .filter((e) => inFolder(e.relativePath, 'images'))
+    .map((e) => ({ ...e, file: e.blob }))
+  const maskFiles = entries
+    .filter((e) => inFolder(e.relativePath, 'masks'))
+    .map((e) => ({ ...e, file: e.blob }))
+  const manifestEntry = entries.find((e) => e.name === 'seg_coco.json')
+
+  if (!manifestEntry) {
+    throw new Error('No annotations/seg_coco.json found inside the zip.')
+  }
+  const manifestJson = JSON.parse(await manifestEntry.blob.text())
+
+  return { photoFiles, maskFiles, manifestJson }
+}
+
 // Parse the manifest into lookups keyed by photo filename stem.
 export function parseManifest(manifestJson) {
   const categoriesById = new Map((manifestJson.categories ?? []).map((c) => [c.id, c.name]))

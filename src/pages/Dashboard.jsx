@@ -1,152 +1,122 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
-import { readZipEntries } from '../lib/zipHelpers'
-import { buildUploadPlan } from '../lib/manifest'
-import { commitUploadPlan } from '../lib/uploads'
+import { downloadBlob } from '../lib/storage'
+import { downloadZip } from '../lib/zipHelpers'
 
-export default function Upload() {
-  const { projectId } = useOutletContext()
-  const [photoZip, setPhotoZip] = useState(null)
-  const [maskZip, setMaskZip] = useState(null)
-  const [manifestFile, setManifestFile] = useState(null)
-  const [plan, setPlan] = useState(null)
+export default function Dashboard() {
+  const { projectId, project } = useOutletContext()
+  const [rows, setRows] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
-  const [result, setResult] = useState(null)
 
-  async function handleBuildPlan() {
-    setError(null)
-    setResult(null)
+  const load = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('active_masks')
+      .select(
+        `id, status, is_missing, category, storage_path,
+         photo_id, photo_filename, photo_storage_path`,
+      )
+      .eq('project_id', projectId)
+    if (error) setError(error.message)
+    else setRows(data)
+  }, [projectId])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  const counts = rows?.reduce(
+    (c, r) => {
+      c[r.status] = (c[r.status] ?? 0) + 1
+      return c
+    },
+    { pending: 0, pass: 0, fail: 0 },
+  )
+
+  function exportCsv() {
+    const header = 'photo_filename,mask_id,category,status,auto_failed_missing\n'
+    const body = (rows ?? [])
+      .map((r) => [r.photo_filename, r.id, r.category ?? '', r.status, r.is_missing].join(','))
+      .join('\n')
+    const blob = new Blob([header + body], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${project?.name ?? 'segcheck'}-review-log.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  // Redo bundle: the failed photos + their rejected masks (for reference),
+  // per your answer earlier — not just the bare photos.
+  async function exportRedoZip() {
     setBusy(true)
+    setError(null)
     try {
-      if (!photoZip || !maskZip || !manifestFile) {
-        throw new Error('Pick a photos zip, a masks zip, and the manifest JSON.')
+      const failed = (rows ?? []).filter((r) => r.status === 'fail')
+      const files = []
+      const seenPhotos = new Set()
+      for (const r of failed) {
+        if (!seenPhotos.has(r.photo_id)) {
+          seenPhotos.add(r.photo_id)
+          const photoBlob = await downloadBlob(r.photo_storage_path)
+          files.push({ path: `photos/${r.photo_filename}`, blob: photoBlob })
+        }
+        if (r.storage_path) {
+          const maskBlob = await downloadBlob(r.storage_path)
+          const maskName = r.storage_path.split('/').pop()
+          files.push({ path: `masks/${r.photo_filename}/${maskName}`, blob: maskBlob })
+        }
       }
-      const [photoEntries, maskEntries, manifestText] = await Promise.all([
-        readZipEntries(photoZip),
-        readZipEntries(maskZip),
-        manifestFile.text(),
-      ])
-      const manifestJson = JSON.parse(manifestText)
-      const photoFiles = photoEntries.map((e) => ({ ...e, file: e.blob }))
-      const maskFiles = maskEntries.map((e) => ({ ...e, file: e.blob }))
-      setPlan(buildUploadPlan({ photoFiles, maskFiles, manifestJson }))
+      await downloadZip(`${project?.name ?? 'segcheck'}-redo.zip`, files)
     } catch (e) {
       setError(e.message)
     } finally {
       setBusy(false)
     }
   }
-
-  async function handleCommit() {
-    setBusy(true)
-    setError(null)
-    try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser()
-      const summary = await commitUploadPlan({ projectId, userId: user.id, plan: plan.plan })
-      setResult(summary)
-      setPlan(null)
-      setPhotoZip(null)
-      setMaskZip(null)
-      setManifestFile(null)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const totalInstances = plan?.plan.reduce((n, p) => n + p.instances.length, 0) ?? 0
-  const totalMissingInstances =
-    plan?.plan.reduce((n, p) => n + p.instances.filter((i) => i.missing).length, 0) ?? 0
-  const totalMissingWhole = plan?.plan.filter((p) => p.missingWhole).length ?? 0
 
   return (
-    <section className="max-w-2xl">
-      <h2 className="text-xl font-semibold">Upload</h2>
-      <p className="mt-1 text-sm text-slate-500">
-        Upload a photos zip, a masks zip, and the manifest (COCO-style instance JSON: images[],
-        annotations[], categories[]). Re-uploading a photo that already exists in this project
-        creates a new version — only the new masks go back into the review queue.
-      </p>
-
-      <div className="mt-6 space-y-3">
-        <FilePicker label="Photos .zip" accept=".zip" file={photoZip} onChange={setPhotoZip} />
-        <FilePicker label="Masks .zip" accept=".zip" file={maskZip} onChange={setMaskZip} />
-        <FilePicker
-          label="Manifest .json"
-          accept=".json,application/json"
-          file={manifestFile}
-          onChange={setManifestFile}
-        />
-      </div>
-
-      <button
-        onClick={handleBuildPlan}
-        disabled={busy}
-        className="mt-4 rounded bg-slate-800 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-      >
-        {busy ? 'Working…' : 'Build plan'}
-      </button>
+    <section>
+      <h2 className="text-xl font-semibold">Dashboard</h2>
 
       {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
 
-      {plan && (
-        <div className="mt-6 rounded-lg border border-slate-200 bg-white p-4 text-sm space-y-1">
-          <p>
-            {plan.plan.length} photos · {totalInstances} instances ({totalMissingInstances}{' '}
-            auto-fail — no matching mask file)
-          </p>
-          <p>{totalMissingWhole} photo(s) not in the manifest at all — auto-failed whole</p>
-          {plan.unmatchedManifestPhotos.length > 0 && (
-            <p className="text-amber-600">
-              {plan.unmatchedManifestPhotos.length} manifest photo(s) never uploaded, skipped:{' '}
-              {plan.unmatchedManifestPhotos.map((p) => p.fileName).join(', ')}
-            </p>
-          )}
-          {plan.orphanMasks.length > 0 && (
-            <p className="text-amber-600">
-              {plan.orphanMasks.length} mask file(s) matched no annotation, ignored:{' '}
-              {plan.orphanMasks.map((m) => m.name).join(', ')}
-            </p>
-          )}
-
-          <button
-            onClick={handleCommit}
-            disabled={busy}
-            className="mt-3 rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-          >
-            {busy ? 'Uploading…' : 'Confirm & upload'}
-          </button>
+      {counts && (
+        <div className="mt-4 flex gap-4">
+          <Stat label="Pending" value={counts.pending} />
+          <Stat label="Pass" value={counts.pass} tone="emerald" />
+          <Stat label="Fail" value={counts.fail} tone="rose" />
         </div>
       )}
 
-      {result && (
-        <p className="mt-4 text-sm text-emerald-700">
-          Done — {result.photosCreated} new photos, {result.photosVersioned} re-uploaded (new
-          version), {result.masksCreated} masks created, {result.autoFailed} auto-failed.
-        </p>
-      )}
+      <div className="mt-6 flex gap-3">
+        <button
+          onClick={exportCsv}
+          className="rounded border border-slate-300 px-4 py-2 text-sm hover:bg-slate-100"
+        >
+          Export CSV
+        </button>
+        <button
+          onClick={exportRedoZip}
+          disabled={busy || !counts?.fail}
+          className="rounded bg-rose-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+        >
+          {busy ? 'Building zip…' : `Download redo batch (${counts?.fail ?? 0})`}
+        </button>
+      </div>
     </section>
   )
 }
 
-function FilePicker({ label, accept, file, onChange }) {
+function Stat({ label, value, tone }) {
+  const toneClass =
+    tone === 'emerald' ? 'text-emerald-600' : tone === 'rose' ? 'text-rose-600' : 'text-slate-800'
   return (
-    <label className="flex items-center justify-between rounded border border-slate-300 px-3 py-2 text-sm">
-      <span className="text-slate-600">{label}</span>
-      <span className="flex items-center gap-2">
-        {file && <span className="text-xs text-slate-400">{file.name}</span>}
-        <input
-          type="file"
-          accept={accept}
-          className="text-xs"
-          onChange={(e) => onChange(e.target.files[0] ?? null)}
-        />
-      </span>
-    </label>
+    <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
+      <div className={`text-2xl font-bold ${toneClass}`}>{value ?? '…'}</div>
+      <div className="text-xs text-slate-400">{label}</div>
+    </div>
   )
 }

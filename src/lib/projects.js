@@ -4,10 +4,22 @@ import { supabase } from './supabaseClient'
 // projects/members the signed-in reviewer is allowed to see.
 
 // Projects the current user is a member of, with their per-project lead flag.
+// IMPORTANT: must filter to the current user's OWN project_members rows.
+// The members_select RLS policy is `is_project_member(project_id)`, which
+// deliberately lets any member see the FULL roster of a shared project (for
+// the Members page) — so an unfiltered select here would return one row per
+// *other* member too, and each one gets mapped into a "project" entry,
+// making the same project appear to duplicate every time someone else is
+// added to it.
 export async function listMyProjects() {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
   const { data, error } = await supabase
     .from('project_members')
     .select('is_lead, added_at, project:projects(id, name, owner_id, created_at)')
+    .eq('reviewer_id', user.id)
     .order('added_at', { ascending: false })
   if (error) throw error
   return data

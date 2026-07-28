@@ -21,7 +21,7 @@ export default function ReviewQueue() {
       .from('active_masks')
       .select(
         `id, manifest_mask_id, storage_path, category, bbox, segmentation, is_crowd,
-         photo:photos ( id, filename, storage_path )`,
+         photo_id, photo_filename, photo_storage_path`,
       )
       .eq('project_id', projectId)
       .eq('status', 'pending')
@@ -63,7 +63,7 @@ export default function ReviewQueue() {
       await supabase.from('review_logs').insert({
         project_id: projectId,
         mask_id: mask.id,
-        photo_id: mask.photo.id,
+        photo_id: mask.photo_id,
         reviewer_id: user.id,
         action: status === 'pass' ? 'confirm_pass' : 'confirm_fail',
         status_before: 'pending',
@@ -104,12 +104,12 @@ export default function ReviewQueue() {
       {mask && (
         <div className="mt-6 space-y-4">
           <div className="text-sm text-slate-500">
-            {mask.photo.filename}
+            {mask.photo_filename}
             {mask.category && <span className="ml-2 text-slate-400">· {mask.category}</span>}
           </div>
 
           <MaskOverlay
-            photoPath={mask.photo.storage_path}
+            photoPath={mask.photo_storage_path}
             maskPath={mask.storage_path}
             bbox={mask.bbox}
             segmentation={mask.segmentation}
