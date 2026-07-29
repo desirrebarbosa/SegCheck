@@ -4,17 +4,22 @@ import { supabase } from '../lib/supabaseClient'
 import { readZipEntries } from '../lib/zipHelpers'
 import { classifyZipEntries, buildUploadPlan } from '../lib/manifest'
 import { commitUploadPlan } from '../lib/uploads'
+import { useToast } from '../components/Toast'
 
+// NOTE: this is a visual reskin only. The underlying logic is still the
+// original single-zip flow (images/ + masks/ + annotations/seg_coco.json in
+// one zip). The dual-zip (original dataset as source of truth + SAM-assisted
+// masks, cross-checked) and multi-split rework are planned but not yet
+// implemented — see PLAN.md.
 export default function Upload() {
   const { projectId } = useOutletContext()
+  const { showError, showSuccess } = useToast()
   const [zipFile, setZipFile] = useState(null)
   const [plan, setPlan] = useState(null)
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState(null)
   const [result, setResult] = useState(null)
 
   async function handleBuildPlan() {
-    setError(null)
     setResult(null)
     setBusy(true)
     try {
@@ -28,7 +33,7 @@ export default function Upload() {
 
       setPlan(buildUploadPlan({ photoFiles, maskFiles, manifestJson }))
     } catch (e) {
-      setError(e.message)
+      showError(e.message)
     } finally {
       setBusy(false)
     }
@@ -36,7 +41,6 @@ export default function Upload() {
 
   async function handleCommit() {
     setBusy(true)
-    setError(null)
     try {
       const {
         data: { user },
@@ -45,8 +49,9 @@ export default function Upload() {
       setResult(summary)
       setPlan(null)
       setZipFile(null)
+      showSuccess('Upload committed.')
     } catch (e) {
-      setError(e.message)
+      showError(e.message)
     } finally {
       setBusy(false)
     }
@@ -59,54 +64,53 @@ export default function Upload() {
 
   return (
     <section className="max-w-2xl">
-      <h2 className="text-xl font-semibold">Upload</h2>
-      <p className="mt-1 text-sm text-slate-500">
-        Upload one zip of a dataset split — it should contain an{' '}
-        <code>images/</code> folder, a <code>masks/</code> folder, and{' '}
-        <code>annotations/seg_coco.json</code>. Re-uploading a photo that already exists in this
-        project creates a new version — only the new masks go back into the review queue.
+      <h2 className="text-lg font-medium">Upload</h2>
+      <p className="mt-1 text-sm text-[#888780]">
+        One zip containing <code className="text-[#5F5E5A]">images/</code>,{' '}
+        <code className="text-[#5F5E5A]">masks/</code>, and{' '}
+        <code className="text-[#5F5E5A]">annotations/seg_coco.json</code>. Re-uploading a photo
+        that already exists creates a new version — only the new masks go back into review.
       </p>
 
-      <div className="mt-6">
-        <label className="flex items-center justify-between rounded border border-slate-300 px-3 py-2 text-sm">
-          <span className="text-slate-600">Dataset .zip</span>
-          <span className="flex items-center gap-2">
-            {zipFile && <span className="text-xs text-slate-400">{zipFile.name}</span>}
-            <input
-              type="file"
-              accept=".zip"
-              className="text-xs"
-              onChange={(e) => setZipFile(e.target.files[0] ?? null)}
-            />
-          </span>
-        </label>
-      </div>
+      <label className="mt-5 flex items-center justify-between rounded-xl border border-[#B4B2A9] px-3.5 py-3 text-sm">
+        <span className="flex items-center gap-2 text-[#1a1a1a]">
+          <i className="ti ti-file-zip text-base text-[#888780]" aria-hidden="true"></i>
+          Dataset .zip
+        </span>
+        <span className="flex items-center gap-2">
+          {zipFile && <span className="text-xs text-[#888780]">{zipFile.name}</span>}
+          <input
+            type="file"
+            accept=".zip"
+            className="text-xs"
+            onChange={(e) => setZipFile(e.target.files[0] ?? null)}
+          />
+        </span>
+      </label>
 
       <button
         onClick={handleBuildPlan}
         disabled={busy}
-        className="mt-4 rounded bg-slate-800 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+        className="mt-4 rounded-lg bg-[#1a1a1a] px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
       >
         {busy ? 'Working…' : 'Build plan'}
       </button>
 
-      {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
-
       {plan && (
-        <div className="mt-6 rounded-lg border border-slate-200 bg-white p-4 text-sm space-y-1">
+        <div className="mt-5 space-y-1.5 rounded-xl border border-[#E5E4DF] bg-[#F7F7F5] p-4 text-sm">
           <p>
             {plan.plan.length} photos · {totalInstances} instances ({totalMissingInstances}{' '}
             auto-fail — no matching mask file)
           </p>
           <p>{totalMissingWhole} photo(s) not in the manifest at all — auto-failed whole</p>
           {plan.unmatchedManifestPhotos.length > 0 && (
-            <p className="text-amber-600">
+            <p className="text-[#993C1D]">
               {plan.unmatchedManifestPhotos.length} manifest photo(s) never uploaded, skipped:{' '}
               {plan.unmatchedManifestPhotos.map((p) => p.fileName).join(', ')}
             </p>
           )}
           {plan.orphanMasks.length > 0 && (
-            <p className="text-amber-600">
+            <p className="text-[#993C1D]">
               {plan.orphanMasks.length} mask file(s) matched no annotation, ignored:{' '}
               {plan.orphanMasks.map((m) => m.name).join(', ')}
             </p>
@@ -115,7 +119,7 @@ export default function Upload() {
           <button
             onClick={handleCommit}
             disabled={busy}
-            className="mt-3 rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+            className="mt-2 rounded-lg bg-[#639922] px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
           >
             {busy ? 'Uploading…' : 'Confirm & upload'}
           </button>
@@ -123,7 +127,7 @@ export default function Upload() {
       )}
 
       {result && (
-        <p className="mt-4 text-sm text-emerald-700">
+        <p className="mt-4 text-sm text-[#27500A]">
           Done — {result.photosCreated} new photos, {result.photosVersioned} re-uploaded (new
           version), {result.masksCreated} masks created, {result.autoFailed} auto-failed.
         </p>

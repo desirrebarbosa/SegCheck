@@ -3,12 +3,13 @@ import { useOutletContext } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { downloadBlob } from '../lib/storage'
 import { downloadZip } from '../lib/zipHelpers'
+import { useToast } from '../components/Toast'
 
 export default function Dashboard() {
   const { projectId, project } = useOutletContext()
+  const { showError, showSuccess } = useToast()
   const [rows, setRows] = useState(null)
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState(null)
 
   const load = useCallback(async () => {
     const { data, error } = await supabase
@@ -18,9 +19,13 @@ export default function Dashboard() {
          photo_id, photo_filename, photo_storage_path`,
       )
       .eq('project_id', projectId)
-    if (error) setError(error.message)
-    else setRows(data)
-  }, [projectId])
+    if (error) {
+      console.error('Dashboard load failed:', error)
+      showError('Could not load dashboard stats.')
+    } else {
+      setRows(data)
+    }
+  }, [projectId, showError])
 
   useEffect(() => {
     load()
@@ -48,11 +53,8 @@ export default function Dashboard() {
     URL.revokeObjectURL(url)
   }
 
-  // Redo bundle: the failed photos + their rejected masks (for reference),
-  // per your answer earlier — not just the bare photos.
   async function exportRedoZip() {
     setBusy(true)
-    setError(null)
     try {
       const failed = (rows ?? []).filter((r) => r.status === 'fail')
       const files = []
@@ -70,8 +72,10 @@ export default function Dashboard() {
         }
       }
       await downloadZip(`${project?.name ?? 'segcheck'}-redo.zip`, files)
+      showSuccess('Redo batch downloaded.')
     } catch (e) {
-      setError(e.message)
+      console.error('exportRedoZip failed:', e)
+      showError('Could not build the redo batch.')
     } finally {
       setBusy(false)
     }
@@ -79,30 +83,30 @@ export default function Dashboard() {
 
   return (
     <section>
-      <h2 className="text-xl font-semibold">Dashboard</h2>
-
-      {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
+      <h2 className="text-lg font-medium">Dashboard</h2>
 
       {counts && (
-        <div className="mt-4 flex gap-4">
+        <div className="mt-4 grid grid-cols-3 gap-3 sm:max-w-md">
           <Stat label="Pending" value={counts.pending} />
-          <Stat label="Pass" value={counts.pass} tone="emerald" />
-          <Stat label="Fail" value={counts.fail} tone="rose" />
+          <Stat label="Pass" value={counts.pass} tone="success" />
+          <Stat label="Fail" value={counts.fail} tone="danger" />
         </div>
       )}
 
-      <div className="mt-6 flex gap-3">
+      <div className="mt-5 flex flex-wrap gap-2">
         <button
           onClick={exportCsv}
-          className="rounded border border-slate-300 px-4 py-2 text-sm hover:bg-slate-100"
+          className="flex items-center gap-1.5 rounded-lg border border-[#B4B2A9] px-3.5 py-2 text-sm hover:bg-[#F7F7F5]"
         >
+          <i className="ti ti-download text-base" aria-hidden="true"></i>
           Export CSV
         </button>
         <button
           onClick={exportRedoZip}
           disabled={busy || !counts?.fail}
-          className="rounded bg-rose-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+          className="flex items-center gap-1.5 rounded-lg bg-[#D85A30] px-3.5 py-2 text-sm font-medium text-white disabled:opacity-50"
         >
+          <i className="ti ti-package text-base" aria-hidden="true"></i>
           {busy ? 'Building zip…' : `Download redo batch (${counts?.fail ?? 0})`}
         </button>
       </div>
@@ -111,12 +115,16 @@ export default function Dashboard() {
 }
 
 function Stat({ label, value, tone }) {
-  const toneClass =
-    tone === 'emerald' ? 'text-emerald-600' : tone === 'rose' ? 'text-rose-600' : 'text-slate-800'
+  const styles =
+    tone === 'success'
+      ? 'bg-[#EAF3DE] text-[#27500A]'
+      : tone === 'danger'
+        ? 'bg-[#FCEBEB] text-[#791F1F]'
+        : 'bg-[#F7F7F5] text-[#1a1a1a]'
   return (
-    <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
-      <div className={`text-2xl font-bold ${toneClass}`}>{value ?? '…'}</div>
-      <div className="text-xs text-slate-400">{label}</div>
+    <div className={`rounded-xl px-3 py-2.5 ${styles}`}>
+      <p className="text-xl font-medium">{value ?? '…'}</p>
+      <p className="text-xs opacity-70">{label}</p>
     </div>
   )
 }

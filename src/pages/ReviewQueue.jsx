@@ -2,21 +2,26 @@ import { useCallback, useEffect, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import MaskOverlay from '../components/MaskOverlay'
+import { getClassColors, setClassColor, defaultColorFor } from '../lib/classColors'
+import { useToast } from '../components/Toast'
 
-// active_masks (a view, see db/bit3_pivot_schema.sql) already restricts to
-// each photo's LATEST version, so a stale mask from a superseded version
-// never shows up here. Masks with is_missing=true are inserted as status
-// 'fail' directly at upload time, so they never reach 'pending' either —
-// nothing to look at, so no manual step needed for them.
 export default function ReviewQueue() {
   const { projectId } = useOutletContext()
-  const [mask, setMask] = useState(undefined) // undefined = loading, null = queue empty
+  const { showError, showSuccess } = useToast()
+  const [mask, setMask] = useState(undefined)
+  const [position, setPosition] = useState(null) // { index, total } within the current photo
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState(null)
   const [counts, setCounts] = useState(null)
+  const [categories, setCategories] = useState([])
+  const [classColors, setClassColors] = useState({})
+  const [colorPanelOpen, setColorPanelOpen] = useState(false)
+
+  // Opacity resets every session, per your call — no persistence.
+  const [opacities, setOpacities] = useState({ photo: 1, mask: 0.5, polygon: 0.35, bbox: 1 })
 
   const loadNext = useCallback(async () => {
     setMask(undefined)
+    setPosition(null)
     const { data, error } = await supabase
       .from('active_masks')
       .select(
@@ -27,30 +32,53 @@ export default function ReviewQueue() {
       .eq('status', 'pending')
       .order('created_at', { ascending: true })
       .limit(1)
-    if (error) setError(error.message)
-    else setMask(data?.[0] ?? null)
-  }, [projectId])
+    if (error) {
+      console.error('loadNext failed:', error)
+      showError('Could not load the review queue.')
+      return
+    }
+    const next = data?.[0] ?? null
+    setMask(next)
+    if (next) {
+      const { data: siblings } = await supabase
+        .from('active_masks')
+        .select('id')
+        .eq('photo_id', next.photo_id)
+        .order('created_at', { ascending: true })
+      if (siblings) {
+        const idx = siblings.findIndex((s) => s.id === next.id)
+        setPosition({ index: idx + 1, total: siblings.length })
+      }
+    }
+  }, [projectId, showError])
 
   const loadCounts = useCallback(async () => {
     const { data, error } = await supabase
       .from('active_masks')
-      .select('status')
+      .select('status, category')
       .eq('project_id', projectId)
     if (error) return
     const c = { pending: 0, pass: 0, fail: 0 }
-    for (const row of data) c[row.status] = (c[row.status] ?? 0) + 1
+    const cats = new Set()
+    for (const row of data) {
+      c[row.status] = (c[row.status] ?? 0) + 1
+      if (row.category) cats.add(row.category)
+    }
     setCounts(c)
+    setCategories([...cats].sort())
   }, [projectId])
 
   useEffect(() => {
     loadNext()
     loadCounts()
-  }, [loadNext, loadCounts])
+    getClassColors(projectId)
+      .then(setClassColors)
+      .catch((e) => console.error('getClassColors failed:', e))
+  }, [loadNext, loadCounts, projectId])
 
   async function decide(status) {
     if (!mask) return
     setBusy(true)
-    setError(null)
     try {
       const {
         data: { user },
@@ -71,69 +99,162 @@ export default function ReviewQueue() {
       })
       await Promise.all([loadNext(), loadCounts()])
     } catch (e) {
-      setError(e.message)
+      console.error('decide failed:', e)
+      showError('Could not save that decision — please try again.')
     } finally {
       setBusy(false)
     }
   }
 
+  async function handleColorChange(category, key, value) {
+    try {
+      const next = await setClassColor(projectId, category, { [key]: value })
+      setClassColors(next)
+    } catch (e) {
+      console.error('setClassColor failed:', e)
+      showError('Could not save that color.')
+    }
+  }
+
+  function colorsFor(category) {
+    const assigned = classColors[category]
+    const fallback = defaultColorFor(category, categories)
+    return { bbox: assigned?.bbox ?? fallback.bbox, polygon: assigned?.polygon ?? fallback.polygon }
+  }
+
   return (
-    <section>
-      <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold">Review Queue</h2>
-        {counts && (
-          <div className="flex gap-3 text-xs">
-            <span className="text-slate-500">{counts.pending} pending</span>
-            <span className="text-emerald-600">{counts.pass} pass</span>
-            <span className="text-rose-600">{counts.fail} fail</span>
+    <div className="flex flex-col gap-4 lg:flex-row">
+      <section className="min-w-0 flex-1">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-medium">Review</h2>
+          {counts && (
+            <div className="flex gap-3 text-xs">
+              <span className="text-[#888780]">{counts.pending} pending</span>
+              <span className="text-[#27500A]">{counts.pass} pass</span>
+              <span className="text-[#791F1F]">{counts.fail} fail</span>
+            </div>
+          )}
+        </div>
+
+        {mask === undefined && <p className="mt-6 text-sm text-[#888780]">Loading…</p>}
+        {mask === null && (
+          <p className="mt-6 text-sm text-[#888780]">
+            Nothing pending — queue is clear. Upload more, or check the Dashboard for the redo
+            batch.
+          </p>
+        )}
+
+        {mask && (
+          <div className="mt-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium">{mask.photo_filename}</span>
+                {mask.category && (
+                  <span className="rounded-lg bg-[#F1EFE8] px-2 py-0.5 text-xs text-[#5F5E5A]">
+                    {mask.category}
+                  </span>
+                )}
+              </div>
+              {position && (
+                <span className="text-xs text-[#888780]">
+                  instance {position.index} of {position.total}
+                </span>
+              )}
+            </div>
+
+            <MaskOverlay
+              photoPath={mask.photo_storage_path}
+              maskPath={mask.storage_path}
+              bbox={mask.bbox}
+              segmentation={mask.segmentation}
+              opacities={opacities}
+              bboxColor={colorsFor(mask.category).bbox}
+              polygonColor={colorsFor(mask.category).polygon}
+            />
+
+            <div className="flex gap-2">
+              <button
+                disabled={busy}
+                onClick={() => decide('fail')}
+                className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[#FCEBEB] py-2.5 text-sm font-medium text-[#791F1F] disabled:opacity-50"
+              >
+                <i className="ti ti-x text-base" aria-hidden="true"></i>
+                No, needs redo
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => decide('pass')}
+                className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[#EAF3DE] py-2.5 text-sm font-medium text-[#27500A] disabled:opacity-50"
+              >
+                <i className="ti ti-check text-base" aria-hidden="true"></i>
+                Yes, looks good
+              </button>
+            </div>
           </div>
         )}
-      </div>
+      </section>
 
-      {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
-
-      {mask === undefined && <p className="mt-6 text-sm text-slate-400">Loading…</p>}
-
-      {mask === null && (
-        <p className="mt-6 text-sm text-slate-400">
-          Nothing pending — queue is clear. Upload more, or check the Dashboard for the redo
-          batch.
-        </p>
-      )}
-
-      {mask && (
-        <div className="mt-6 space-y-4">
-          <div className="text-sm text-slate-500">
-            {mask.photo_filename}
-            {mask.category && <span className="ml-2 text-slate-400">· {mask.category}</span>}
-          </div>
-
-          <MaskOverlay
-            photoPath={mask.photo_storage_path}
-            maskPath={mask.storage_path}
-            bbox={mask.bbox}
-            segmentation={mask.segmentation}
-            isCrowd={mask.is_crowd}
-          />
-
-          <div className="flex gap-3">
-            <button
-              disabled={busy}
-              onClick={() => decide('pass')}
-              className="rounded bg-emerald-600 px-5 py-2 text-sm font-medium text-white disabled:opacity-50"
-            >
-              Yes — mask is good
-            </button>
-            <button
-              disabled={busy}
-              onClick={() => decide('fail')}
-              className="rounded bg-rose-600 px-5 py-2 text-sm font-medium text-white disabled:opacity-50"
-            >
-              No — needs redo
-            </button>
+      <aside className="w-full flex-shrink-0 space-y-4 lg:w-52">
+        <div>
+          <p className="mb-2 text-xs text-[#888780]">Layer opacity</p>
+          <div className="space-y-2">
+            {(['photo', 'mask', 'polygon', 'bbox']).map((key) => (
+              <label key={key} className="block text-xs text-[#5F5E5A] capitalize">
+                {key}
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={opacities[key] * 100}
+                  onChange={(e) =>
+                    setOpacities((o) => ({ ...o, [key]: Number(e.target.value) / 100 }))
+                  }
+                  className="w-full"
+                />
+              </label>
+            ))}
           </div>
         </div>
-      )}
-    </section>
+
+        <button
+          onClick={() => setColorPanelOpen((v) => !v)}
+          className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-[#B4B2A9] py-2 text-sm hover:bg-[#F7F7F5]"
+        >
+          <i className="ti ti-palette text-base" aria-hidden="true"></i>
+          Class colors
+        </button>
+
+        {colorPanelOpen && (
+          <div className="space-y-2 border-t border-[#E5E4DF] pt-3">
+            <p className="text-xs text-[#888780]">Bbox / polygon color</p>
+            {categories.length === 0 && (
+              <p className="text-xs text-[#888780]">No categories yet.</p>
+            )}
+            {categories.map((cat) => {
+              const c = colorsFor(cat)
+              return (
+                <div key={cat} className="flex items-center gap-2">
+                  <span className="flex-1 truncate text-xs">{cat}</span>
+                  <input
+                    type="color"
+                    value={c.bbox}
+                    onChange={(e) => handleColorChange(cat, 'bbox', e.target.value)}
+                    className="h-5 w-5 rounded border-none p-0"
+                    aria-label={`${cat} bbox color`}
+                  />
+                  <input
+                    type="color"
+                    value={c.polygon}
+                    onChange={(e) => handleColorChange(cat, 'polygon', e.target.value)}
+                    className="h-5 w-5 rounded border-none p-0"
+                    aria-label={`${cat} polygon color`}
+                  />
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </aside>
+    </div>
   )
 }

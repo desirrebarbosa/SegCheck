@@ -1,86 +1,103 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
-import { listMembers, addMemberByEmail } from '../lib/projects'
+import { listMembers, addMemberByEmail, removeMember } from '../lib/projects'
+import { useToast } from '../components/Toast'
 
-// Per-project account roster. Leads can add accounts by email.
 export default function Members() {
-  const { projectId, isLead } = useOutletContext()
+  const { projectId, isOwner } = useOutletContext()
+  const { showError, showSuccess } = useToast()
   const [members, setMembers] = useState(null)
   const [email, setEmail] = useState('')
   const [busy, setBusy] = useState(false)
-  const [msg, setMsg] = useState(null)
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     try {
       setMembers(await listMembers(projectId))
     } catch (e) {
-      setMsg({ kind: 'err', text: e.message })
+      console.error('listMembers failed:', e)
+      showError('Could not load members.')
     }
-  }
+  }, [projectId, showError])
 
   useEffect(() => {
     refresh()
-  }, [projectId])
+  }, [refresh])
 
   async function handleAdd(e) {
     e.preventDefault()
     if (!email.trim()) return
     setBusy(true)
-    setMsg(null)
     try {
       await addMemberByEmail(projectId, email)
       setEmail('')
-      setMsg({ kind: 'ok', text: 'Member added.' })
       await refresh()
+      showSuccess('Member added.')
     } catch (e) {
-      setMsg({ kind: 'err', text: e.message })
+      showError(e.message)
     } finally {
       setBusy(false)
     }
   }
 
+  async function handleRemove(reviewerId, label) {
+    if (!confirm(`Remove ${label} from this project?`)) return
+    try {
+      await removeMember(projectId, reviewerId)
+      await refresh()
+      showSuccess('Member removed.')
+    } catch (e) {
+      showError('Could not remove member — ' + e.message)
+    }
+  }
+
   return (
     <section className="max-w-xl">
-      <h2 className="text-xl font-semibold">Members</h2>
+      <h2 className="text-lg font-medium">Members</h2>
 
-      {isLead ? (
-        <form onSubmit={handleAdd} className="mt-4 flex gap-2">
-          <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="account email to add"
-            className="flex-1 rounded border border-slate-300 px-3 py-2 text-sm"
-          />
-          <button
-            type="submit"
-            disabled={busy}
-            className="rounded bg-slate-800 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-          >
-            Add
-          </button>
-        </form>
-      ) : (
-        <p className="mt-2 text-xs text-slate-400">
-          Only a project lead can add members.
-        </p>
-      )}
+      <form onSubmit={handleAdd} className="mt-4 flex gap-2">
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="email@example.com"
+          className="flex-1 rounded-lg border border-[#B4B2A9] px-3 py-2 text-sm"
+        />
+        <button
+          type="submit"
+          disabled={busy}
+          className="rounded-lg bg-[#1a1a1a] px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+        >
+          {busy ? 'Adding…' : 'Add'}
+        </button>
+      </form>
 
-      {msg && (
-        <p className={`mt-3 text-xs ${msg.kind === 'ok' ? 'text-emerald-600' : 'text-rose-600'}`}>
-          {msg.text}
-        </p>
-      )}
-
-      <ul className="mt-6 divide-y divide-slate-200 rounded-lg border border-slate-200 bg-white">
-        {members === null && <li className="px-4 py-3 text-sm text-slate-400">Loading…</li>}
+      <div className="mt-5 divide-y divide-[#E5E4DF] rounded-xl border border-[#E5E4DF]">
+        {members === null && <p className="p-4 text-sm text-[#888780]">Loading…</p>}
         {members?.map((m) => (
-          <li key={m.reviewer.id} className="flex items-center justify-between px-4 py-3">
-            <span className="text-sm">{m.reviewer.email ?? m.reviewer.display_name}</span>
-            <span className="text-xs text-slate-400">{m.is_lead ? 'lead' : 'reviewer'}</span>
-          </li>
+          <div key={m.reviewer.id} className="flex items-center justify-between px-4 py-2.5">
+            <div>
+              <p className="text-sm">{m.reviewer.display_name || m.reviewer.email}</p>
+              <p className="text-xs text-[#888780]">{m.reviewer.email}</p>
+            </div>
+            <div className="flex items-center gap-3">
+              {m.is_lead && (
+                <span className="rounded-lg bg-[#E6F1FB] px-2 py-0.5 text-xs text-[#0C447C]">
+                  lead
+                </span>
+              )}
+              {isOwner && (
+                <button
+                  onClick={() => handleRemove(m.reviewer.id, m.reviewer.email)}
+                  aria-label={`Remove ${m.reviewer.email}`}
+                  className="text-[#888780] hover:text-[#791F1F]"
+                >
+                  <i className="ti ti-x text-base" aria-hidden="true"></i>
+                </button>
+              )}
+            </div>
+          </div>
         ))}
-      </ul>
+      </div>
     </section>
   )
 }

@@ -104,3 +104,16 @@ export async function addMemberByEmail(projectId, email) {
     throw e2
   }
 }
+
+// Remove a member from a project. Gated to owner-only in the UI (RLS also
+// only allows a project lead to delete rows via projects_delete-style
+// policies — owner is additionally enforced client-side per your call that
+// membership changes should be owner-only, not just lead-only).
+export async function removeMember(projectId, reviewerId) {
+  const { error } = await supabase
+    .from('project_members')
+    .delete()
+    .eq('project_id', projectId)
+    .eq('reviewer_id', reviewerId)
+  if (error) throw error
+}

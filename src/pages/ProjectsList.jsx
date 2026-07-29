@@ -2,23 +2,22 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { listMyProjects, createProject } from '../lib/projects'
+import { useToast } from '../components/Toast'
 
-// Landing screen after login: the reviewer's projects + "Add project".
 export default function ProjectsList({ session }) {
+  const { showError } = useToast()
   const [projects, setProjects] = useState(null) // null = loading
+  const [showNew, setShowNew] = useState(false)
   const [name, setName] = useState('')
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState(null)
 
   async function refresh() {
     try {
-      setError(null)
       setProjects(await listMyProjects())
     } catch (e) {
-      // Keep raw DB internals out of the UI; log for debugging only.
       console.error('listMyProjects failed:', e)
       setProjects([])
-      setError('Could not load your projects. Please try again.')
+      showError('Could not load your projects. Please try again.')
     }
   }
 
@@ -30,76 +29,90 @@ export default function ProjectsList({ session }) {
     e.preventDefault()
     if (!name.trim()) return
     setBusy(true)
-    setError(null)
     try {
       await createProject(name)
       setName('')
+      setShowNew(false)
       await refresh()
     } catch (e) {
       console.error('createProject failed:', e)
-      setError('Could not create the project. Please try again.')
+      showError('Could not create the project. Please try again.')
     } finally {
       setBusy(false)
     }
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800">
-      <header className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
-        <span className="font-bold">SegCheck</span>
-        <div className="flex items-center gap-3 text-sm text-slate-500">
-          <span>{session.user.email}</span>
+    <div className="min-h-screen bg-white text-[#1a1a1a]">
+      <header className="flex items-center justify-between border-b border-[#E5E4DF] px-4 py-3 md:px-6">
+        <span className="text-sm font-medium text-[#5F5E5A]">Projects</span>
+        <div className="flex items-center gap-3 text-sm text-[#888780]">
+          <span className="hidden sm:inline">{session.user.email}</span>
           <button
             onClick={() => supabase.auth.signOut()}
-            className="rounded border border-slate-300 px-3 py-1 hover:bg-slate-100"
+            className="rounded-lg border border-[#B4B2A9] px-3 py-1.5 text-xs hover:bg-[#F7F7F5]"
           >
             Sign out
           </button>
         </div>
       </header>
 
-      <main className="mx-auto max-w-2xl p-6">
-        <h2 className="text-xl font-semibold">Your projects</h2>
-
-        <form onSubmit={handleAdd} className="mt-4 flex gap-2">
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="New project name"
-            className="flex-1 rounded border border-slate-300 px-3 py-2 text-sm"
-          />
+      <main className="mx-auto max-w-3xl p-4 md:p-6">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-lg font-medium">Your projects</h2>
           <button
-            type="submit"
-            disabled={busy}
-            className="rounded bg-slate-800 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+            onClick={() => setShowNew((v) => !v)}
+            className="flex items-center gap-1.5 rounded-lg border border-[#B4B2A9] px-3 py-1.5 text-sm hover:bg-[#F7F7F5]"
           >
-            + Add project
+            <i className="ti ti-plus text-base" aria-hidden="true"></i>
+            New project
           </button>
-        </form>
+        </div>
 
-        {error && <p className="mt-3 text-xs text-rose-600">{error}</p>}
+        {showNew && (
+          <form onSubmit={handleAdd} className="mb-5 flex gap-2">
+            <input
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Project name"
+              className="flex-1 rounded-lg border border-[#B4B2A9] px-3 py-2 text-sm"
+            />
+            <button
+              type="submit"
+              disabled={busy}
+              className="rounded-lg bg-[#1a1a1a] px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+            >
+              {busy ? 'Creating…' : 'Create'}
+            </button>
+          </form>
+        )}
 
-        <ul className="mt-6 space-y-2">
-          {projects === null && <li className="text-sm text-slate-400">Loading…</li>}
-          {projects?.length === 0 && !error && (
-            <li className="text-sm text-slate-400">
-              No projects yet — create one above.
-            </li>
-          )}
+        {projects === null && <p className="text-sm text-[#888780]">Loading…</p>}
+        {projects?.length === 0 && (
+          <p className="text-sm text-[#888780]">No projects yet — create one above.</p>
+        )}
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           {projects?.map((p) => (
-            <li key={p.id}>
-              <Link
-                to={`/projects/${p.id}`}
-                className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-3 hover:border-slate-400"
-              >
-                <span className="font-medium">{p.name}</span>
-                <span className="text-xs text-slate-400">
+            <Link
+              key={p.id}
+              to={`/projects/${p.id}`}
+              className="rounded-xl border border-[#E5E4DF] bg-[#F7F7F5] p-4 hover:border-[#B4B2A9]"
+            >
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-sm font-medium">{p.name}</span>
+                <span
+                  className={`rounded-lg px-2 py-0.5 text-xs ${
+                    p.is_lead ? 'bg-[#E6F1FB] text-[#0C447C]' : 'bg-[#F1EFE8] text-[#5F5E5A]'
+                  }`}
+                >
                   {p.is_lead ? 'lead' : 'reviewer'}
                 </span>
-              </Link>
-            </li>
+              </div>
+            </Link>
           ))}
-        </ul>
+        </div>
       </main>
     </div>
   )
