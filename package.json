@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",
+    "@tabler/icons-webfont": "^3.46.0",
     "jszip": "^3.10.1",
     "pg": "^8.21.0",
     "react": "^19.2.7",

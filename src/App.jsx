@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { supabase } from './lib/supabaseClient'
 import { useSession } from './auth/useSession'
+import { ToastProvider } from './components/Toast'
 import Login from './pages/Login'
 import ProjectsList from './pages/ProjectsList'
 import ProjectLayout from './components/ProjectLayout'
@@ -32,28 +33,36 @@ export default function App() {
 
   if (session === undefined) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-400">
+      <div className="flex min-h-screen items-center justify-center bg-white text-[#888780]">
         Loading…
       </div>
     )
   }
 
-  if (!session) return <Login />
+  if (!session) {
+    return (
+      <ToastProvider>
+        <Login />
+      </ToastProvider>
+    )
+  }
 
   return (
-    <BrowserRouter>
-      <Routes>
-        {/* Landing: pick or create a project */}
-        <Route path="/" element={<ProjectsList session={session} />} />
+    <ToastProvider>
+      <BrowserRouter>
+        <Routes>
+          {/* Landing: pick or create a project */}
+          <Route path="/" element={<ProjectsList session={session} />} />
 
-        {/* Everything inside a project is scoped by :projectId */}
-        <Route path="/projects/:projectId" element={<ProjectLayout session={session} />}>
-          <Route index element={<ReviewQueue />} />
-          <Route path="upload" element={<Upload />} />
-          <Route path="dashboard" element={<Dashboard />} />
-          <Route path="members" element={<Members />} />
-        </Route>
-      </Routes>
-    </BrowserRouter>
+          {/* Everything inside a project is scoped by :projectId */}
+          <Route path="/projects/:projectId" element={<ProjectLayout session={session} />}>
+            <Route index element={<ReviewQueue />} />
+            <Route path="upload" element={<Upload />} />
+            <Route path="dashboard" element={<Dashboard />} />
+            <Route path="members" element={<Members />} />
+          </Route>
+        </Routes>
+      </BrowserRouter>
+    </ToastProvider>
   )
 }
