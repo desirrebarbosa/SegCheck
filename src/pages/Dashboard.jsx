@@ -9,6 +9,45 @@ import { useToast } from '../components/Toast'
 // Count-only queries (head: true) instead of fetching every active_masks
 // row just to tally them — cheap regardless of project size. Full rows are
 // only fetched on demand, when the person actually clicks export.
+function csvField(value) {
+  const s = String(value ?? '')
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+// One row per category: how many were never produced by the SAM-assisted
+// pipeline at all (is_missing) vs how many a reviewer actually looked at
+// and rejected — the annotator needs to know which is which, since a
+// missing mask means "do this object", not "redo it".
+function buildRedoInstructionsCsv(failedRows) {
+  const byCategory = new Map()
+  for (const r of failedRows) {
+    const cat = r.category ?? '(uncategorized)'
+    const entry = byCategory.get(cat) ?? { missing: 0, rejected: 0 }
+    if (r.is_missing) entry.missing += 1
+    else entry.rejected += 1
+    byCategory.set(cat, entry)
+  }
+
+  const totalMissing = failedRows.filter((r) => r.is_missing).length
+  const totalRejected = failedRows.length - totalMissing
+
+  const lines = [
+    csvField('This zip contains photos and masks that failed QA review and need re-annotation.'),
+    csvField('missing_count = no mask was ever produced for this object (do it from scratch).'),
+    csvField('rejected_count = a mask existed but a reviewer rejected it (redo/fix it).'),
+    '',
+    ['category', 'missing_count', 'rejected_count', 'total'].map(csvField).join(','),
+    ...[...byCategory.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([cat, { missing, rejected }]) =>
+        [cat, missing, rejected, missing + rejected].map(csvField).join(','),
+      ),
+    ['TOTAL', totalMissing, totalRejected, failedRows.length].map(csvField).join(','),
+  ]
+
+  return new Blob([lines.join('\n')], { type: 'text/csv' })
+}
+
 async function fetchStatusCounts(projectId) {
   const statuses = ['pending', 'pass', 'fail']
   const counts = {}
@@ -34,6 +73,36 @@ async function fetchAllActiveMasks(projectId) {
        photo_id, photo_filename, photo_storage_path`,
     )
     .eq('project_id', projectId)
+  if (error) throw error
+  return data
+}
+
+// Splits that actually have at least one accepted (pass) mask, with counts
+// — used to render one "download" button per split rather than guessing
+// which splits exist or forcing one giant combined zip.
+async function fetchPassedSplitCounts(projectId) {
+  const { data, error } = await supabase
+    .from('active_masks')
+    .select('photo_split')
+    .eq('project_id', projectId)
+    .eq('status', 'pass')
+  if (error) throw error
+  const counts = new Map()
+  for (const row of data) {
+    const key = row.photo_split ?? '(no split)'
+    counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  return counts
+}
+
+async function fetchPassedForSplit(projectId, split) {
+  let query = supabase
+    .from('active_masks')
+    .select('id, storage_path, photo_id, photo_filename, photo_storage_path')
+    .eq('project_id', projectId)
+    .eq('status', 'pass')
+  query = split === '(no split)' ? query.is('photo_split', null) : query.eq('photo_split', split)
+  const { data, error } = await query
   if (error) throw error
   return data
 }
@@ -100,6 +169,7 @@ export default function Dashboard() {
           files.push({ path: `masks/${r.photo_filename}/${maskName}`, blob: maskBlob })
         }
       }
+      files.push({ path: 'instructions.csv', blob: buildRedoInstructionsCsv(failed) })
       await downloadZip(`${project?.name ?? 'segcheck'}-redo.zip`, files)
       showSuccess('Redo batch downloaded.')
     } catch (e) {
@@ -141,6 +211,8 @@ export default function Dashboard() {
         </button>
       </div>
 
+      <AnnotatedExport projectId={projectId} projectName={project?.name} />
+
       {isOwner && (
         <>
           <ManagePhotos projectId={projectId} onChanged={loadCounts} />
@@ -171,6 +243,87 @@ function Stat({ label, value, tone }) {
 }
 
 const PAGE_SIZE = 50
+
+// Downloads the accepted (status: pass) masks + their photos, one zip per
+// split — the "new annotated files" the reviewed dataset actually produces,
+// as opposed to the redo batch (which is the rejected ones). Available to
+// any member, not owner-gated, since it's a read/export action rather than
+// a destructive one.
+function AnnotatedExport({ projectId, projectName }) {
+  const { showError, showSuccess } = useToast()
+  const [splitCounts, setSplitCounts] = useState(null) // Map<split, count>
+  const [downloadingSplit, setDownloadingSplit] = useState(null)
+
+  const load = useCallback(async () => {
+    try {
+      setSplitCounts(await fetchPassedSplitCounts(projectId))
+    } catch (e) {
+      console.error('fetchPassedSplitCounts failed:', e)
+      showError('Could not load the annotated export list.')
+    }
+  }, [projectId, showError])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  async function handleDownload(split) {
+    setDownloadingSplit(split)
+    try {
+      const rows = await fetchPassedForSplit(projectId, split)
+      const files = []
+      const seenPhotos = new Set()
+      for (const r of rows) {
+        if (!seenPhotos.has(r.photo_id)) {
+          seenPhotos.add(r.photo_id)
+          const photoBlob = await downloadBlob(r.photo_storage_path)
+          files.push({ path: `photos/${r.photo_filename}`, blob: photoBlob })
+        }
+        if (r.storage_path) {
+          const maskBlob = await downloadBlob(r.storage_path)
+          const maskName = r.storage_path.split('/').pop()
+          files.push({ path: `masks/${r.photo_filename}/${maskName}`, blob: maskBlob })
+        }
+      }
+      const label = split === '(no split)' ? 'default' : split
+      await downloadZip(`${projectName ?? 'segcheck'}-${label}-annotated.zip`, files)
+      showSuccess(`Downloaded ${label}.`)
+    } catch (e) {
+      console.error('AnnotatedExport download failed:', e)
+      showError('Could not build that split\u2019s zip.')
+    } finally {
+      setDownloadingSplit(null)
+    }
+  }
+
+  if (splitCounts && splitCounts.size === 0) return null
+
+  return (
+    <div className="mt-6 rounded-xl border border-[#E5E4DF] p-4">
+      <p className="text-sm font-medium text-[#1a1a1a]">Annotated dataset (accepted masks)</p>
+      <p className="mt-0.5 text-xs text-[#888780]">
+        One zip per split, containing only the masks marked "pass" and their photos.
+      </p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {splitCounts === null && <p className="text-sm text-[#888780]">Loading…</p>}
+        {splitCounts &&
+          [...splitCounts.entries()].map(([split, count]) => (
+            <button
+              key={split}
+              onClick={() => handleDownload(split)}
+              disabled={downloadingSplit !== null}
+              className="flex items-center gap-1.5 rounded-lg bg-[#639922] px-3.5 py-2 text-sm font-medium text-white disabled:opacity-50"
+            >
+              <i className="ti ti-download text-base" aria-hidden="true"></i>
+              {downloadingSplit === split
+                ? 'Building…'
+                : `${split === '(no split)' ? 'default' : split} (${count})`}
+            </button>
+          ))}
+      </div>
+    </div>
+  )
+}
 
 // Owner-only. Paginated list (50/page) with thumbnails; "Delete selected"
 // removes the DB rows (versions/masks cascade) AND their Storage files
