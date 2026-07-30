@@ -4,7 +4,7 @@ import { listMembers, addMemberByEmail, removeMember } from '../lib/projects'
 import { useToast } from '../components/Toast'
 
 export default function Members() {
-  const { projectId, isOwner } = useOutletContext()
+  const { projectId, project, isOwner } = useOutletContext()
   const { showError, showSuccess } = useToast()
   const [members, setMembers] = useState(null)
   const [email, setEmail] = useState('')
@@ -40,6 +40,10 @@ export default function Members() {
   }
 
   async function handleRemove(reviewerId, label) {
+    if (reviewerId === project?.owner_id) {
+      showError('The project owner can\u2019t be removed from the project.')
+      return
+    }
     if (!confirm(`Remove ${label} from this project?`)) return
     try {
       await removeMember(projectId, reviewerId)
@@ -85,7 +89,12 @@ export default function Members() {
                   lead
                 </span>
               )}
-              {isOwner && (
+              {m.reviewer.id === project?.owner_id && (
+                <span className="rounded-lg bg-[#F3F1E9] px-2 py-0.5 text-xs text-[#5F5E5A]">
+                  owner
+                </span>
+              )}
+              {isOwner && m.reviewer.id !== project?.owner_id && (
                 <button
                   onClick={() => handleRemove(m.reviewer.id, m.reviewer.email)}
                   aria-label={`Remove ${m.reviewer.email}`}
