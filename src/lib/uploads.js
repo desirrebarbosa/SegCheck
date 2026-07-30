@@ -2,43 +2,67 @@ import { supabase } from './supabaseClient'
 import { uploadFile } from './storage'
 import { makeThumbnail } from './thumbnails'
 
+// How many photos (and, separately, how many mask files within one photo)
+// are processed at once. Bounded rather than unbounded `Promise.all` so we
+// get the speed-up from parallelizing without flooding Supabase / the
+// browser with hundreds of simultaneous requests at once.
+const CONCURRENCY = 6
+
+// Runs `fn` over `items` with at most `limit` running at once. Results are
+// returned in the same order as `items`, regardless of completion order.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length)
+  let next = 0
+  async function worker() {
+    while (next < items.length) {
+      const i = next++
+      results[i] = await fn(items[i], i)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
 // Commits ONE split's plan (from buildUploadPlanForSplit / the `plan` array
-// inside a buildMultiSplitUploadPlan() result) to Supabase. Same behavior as
-// before, plus: photos are now found/created scoped to project+split+
-// filename (a filename can repeat across splits), and `split` is stored on
-// the photo row.
-async function commitSplitPlan({ projectId, split, userId, plan }) {
+// inside a buildMultiSplitUploadPlan() result) to Supabase.
+//
+// Same end result as before, but restructured for speed:
+//   - one query up front for every photo that might already exist in this
+//     split, instead of one `select` per photo inside the loop
+//   - photos (and, within a photo, mask files) are processed in bounded
+//     parallel batches instead of one strictly-sequential loop
+//   - all of one photo's mask rows are inserted in a single batched
+//     `insert([...])` instead of one insert per mask
+//   - thumbnail generation/upload no longer blocks the rest of that
+//     photo's processing (it was already treated as non-fatal on failure,
+//     so there's no reason to wait on it before moving on)
+//
+// `onProgress`, if given, is called as `onProgress(done, total)` once per
+// photo that finishes — since photos now complete out of order (bounded
+// concurrency, not strictly sequential), `done` only ever counts finished
+// work, it doesn't correspond to `plan`'s original index order.
+export async function commitSplitPlan({ projectId, split, userId, plan, onProgress }) {
   const summary = { photosCreated: 0, photosVersioned: 0, masksCreated: 0, autoFailed: 0 }
 
-  for (const item of plan) {
+  // Pre-fetch every existing photo for this project+split in one query,
+  // instead of one `select` per photo in the loop below.
+  const { data: existingPhotos, error: existErr } = await supabase
+    .from('photos')
+    .select('*')
+    .eq('project_id', projectId)
+    .eq('split', split)
+  if (existErr) throw existErr
+  const existingByFilename = new Map(existingPhotos.map((p) => [p.filename, p]))
+
+  let done = 0
+
+  await mapWithConcurrency(plan, CONCURRENCY, async (item) => {
     const filename = item.photo.relativePath ?? item.photo.name
-
-    const { data: existing, error: findErr } = await supabase
-      .from('photos')
-      .select('*')
-      .eq('project_id', projectId)
-      .eq('split', split)
-      .eq('filename', filename)
-      .maybeSingle()
-    if (findErr) throw findErr
-
-    let photo = existing
+    let photo = existingByFilename.get(filename) ?? null
     const photoPath = `${projectId}/${split}/photos/${item.stem}-${item.photo.name}`
 
     if (!photo) {
       await uploadFile(photoPath, item.photo.blob ?? item.photo.file)
-
-      let thumbnailPath = null
-      try {
-        const thumbBlob = await makeThumbnail(item.photo.blob ?? item.photo.file)
-        thumbnailPath = `${projectId}/${split}/thumbs/${item.stem}.jpg`
-        await uploadFile(thumbnailPath, thumbBlob)
-      } catch (e) {
-        // Non-fatal: the photo itself already uploaded fine. A missing
-        // thumbnail just means the manage-photos list falls back to no
-        // preview for this one row, not a failed upload.
-        console.error('Thumbnail generation failed for', filename, e)
-      }
 
       const { data: created, error: insErr } = await supabase
         .from('photos')
@@ -47,7 +71,7 @@ async function commitSplitPlan({ projectId, split, userId, plan }) {
           split,
           filename,
           storage_path: photoPath,
-          thumbnail_path: thumbnailPath,
+          thumbnail_path: null,
           latest_version: 1,
           uploaded_by: userId,
         })
@@ -56,6 +80,23 @@ async function commitSplitPlan({ projectId, split, userId, plan }) {
       if (insErr) throw insErr
       photo = created
       summary.photosCreated += 1
+
+      // Fire-and-forget: non-fatal on failure (same as before), and
+      // doesn't need to hold up this photo's masks/version or the next
+      // photo in the batch. Patches the row with the thumbnail path once
+      // it's ready.
+      makeThumbnail(item.photo.blob ?? item.photo.file)
+        .then(async (thumbBlob) => {
+          const thumbnailPath = `${projectId}/${split}/thumbs/${item.stem}.jpg`
+          await uploadFile(thumbnailPath, thumbBlob)
+          const { error } = await supabase
+            .from('photos')
+            .update({ thumbnail_path: thumbnailPath })
+            .eq('id', photo.id)
+          if (error) throw error
+        })
+        .catch((e) => console.error('Thumbnail generation failed for', filename, e))
+
       await supabase.from('review_logs').insert({
         project_id: projectId,
         photo_id: photo.id,
@@ -64,13 +105,13 @@ async function commitSplitPlan({ projectId, split, userId, plan }) {
         detail: { filename, split },
       })
     } else {
-      const nextVersion = existing.latest_version + 1
+      const nextVersion = photo.latest_version + 1
       const { error: updErr } = await supabase
         .from('photos')
         .update({ latest_version: nextVersion })
         .eq('id', photo.id)
       if (updErr) throw updErr
-      photo.latest_version = nextVersion
+      photo = { ...photo, latest_version: nextVersion }
       summary.photosVersioned += 1
     }
 
@@ -111,49 +152,63 @@ async function commitSplitPlan({ projectId, split, userId, plan }) {
         status_after: 'fail',
         detail: { reason: 'photo not present in SAM-assisted manifest', split },
       })
-      continue
-    }
+    } else if (item.instances.length > 0) {
+      // Upload every instance's mask FILE in parallel (bounded)...
+      const withPaths = await mapWithConcurrency(item.instances, CONCURRENCY, async (inst) => {
+        let maskPath = null
+        if (inst.mask) {
+          maskPath = `${projectId}/${split}/masks/${item.stem}/${inst.annotationId}-${inst.mask.name}`
+          await uploadFile(maskPath, inst.mask.blob ?? inst.mask.file)
+        }
+        return { inst, maskPath }
+      })
 
-    for (const inst of item.instances) {
-      let maskPath = null
-      if (inst.mask) {
-        maskPath = `${projectId}/${split}/masks/${item.stem}/${inst.annotationId}-${inst.mask.name}`
-        await uploadFile(maskPath, inst.mask.blob ?? inst.mask.file)
-      }
+      // ...then insert all resulting mask ROWS in a single batched insert,
+      // instead of one insert per instance.
+      const maskRows = withPaths.map(({ inst, maskPath }) => ({
+        photo_version_id: version.id,
+        project_id: projectId,
+        manifest_mask_id: String(inst.annotationId),
+        storage_path: maskPath,
+        is_missing: inst.missing,
+        status: inst.missing ? 'fail' : 'pending',
+        category: inst.category,
+        bbox: inst.bbox,
+        segmentation: inst.segmentation,
+        is_crowd: !!inst.isCrowd,
+      }))
 
-      const { data: mask, error: mErr } = await supabase
+      const { data: insertedMasks, error: mErr } = await supabase
         .from('masks')
-        .insert({
-          photo_version_id: version.id,
-          project_id: projectId,
-          manifest_mask_id: String(inst.annotationId),
-          storage_path: maskPath,
-          is_missing: inst.missing,
-          status: inst.missing ? 'fail' : 'pending',
-          category: inst.category,
-          bbox: inst.bbox,
-          segmentation: inst.segmentation,
-          is_crowd: !!inst.isCrowd,
-        })
+        .insert(maskRows)
         .select()
-        .single()
       if (mErr) throw mErr
-      summary.masksCreated += 1
+      summary.masksCreated += insertedMasks.length
 
-      if (inst.missing) {
-        summary.autoFailed += 1
-        await supabase.from('review_logs').insert({
+      // Matched back up by manifest_mask_id (not array position) since a
+      // batched insert's response row order isn't a contract worth relying on.
+      const insertedByAnnotationId = new Map(insertedMasks.map((m) => [m.manifest_mask_id, m]))
+      const failLogs = withPaths
+        .filter(({ inst }) => inst.missing)
+        .map(({ inst }) => ({
           project_id: projectId,
-          mask_id: mask.id,
+          mask_id: insertedByAnnotationId.get(String(inst.annotationId))?.id,
           photo_id: photo.id,
           reviewer_id: userId,
           action: 'auto_fail_missing',
           status_after: 'fail',
           detail: { annotation_id: inst.annotationId, reason: 'no matching mask file', split },
-        })
+        }))
+      summary.autoFailed += failLogs.length
+      if (failLogs.length > 0) {
+        const { error: logErr } = await supabase.from('review_logs').insert(failLogs)
+        if (logErr) throw logErr
       }
     }
-  }
+
+    done += 1
+    onProgress?.(done, plan.length)
+  })
 
   return summary
 }

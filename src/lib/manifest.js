@@ -200,6 +200,76 @@ export function buildUploadPlanForSplit({
   return { plan, unmatchedOriginalPhotos, orphanMasks, extraPhotosNotInOriginal }
 }
 
+// --- Single-split upload (zip root IS the split) -----------------------
+// Alternative to the multi-split flow above, for when the person uploads
+// one split's zip at a time — the zip already contains images/ +
+// annotations/coco.json (or masks/ + annotations/seg_coco.json) directly
+// at its root, with no split-name subfolder to detect. The split name is
+// therefore supplied explicitly by the caller rather than inferred from
+// folder structure.
+
+// Groups the ORIGINAL zip's entries with no split detection:
+// { photoFiles, originalManifestJson }
+export async function classifySingleOriginalZip(entries) {
+  const photoFiles = []
+  let manifestEntry = null
+  for (const e of entries) {
+    if (inFolder(e.relativePath, 'images')) {
+      photoFiles.push({ ...e, file: e.blob })
+    } else if (e.name === 'coco.json') {
+      manifestEntry = e
+    }
+  }
+  if (!manifestEntry) {
+    throw new Error('Original dataset zip: no annotations/coco.json found.')
+  }
+  return {
+    photoFiles,
+    originalManifestJson: JSON.parse(await manifestEntry.blob.text()),
+  }
+}
+
+// Groups the SAM-ASSISTED zip's entries with no split detection:
+// { maskFiles, samManifestJson }
+export async function classifySingleSamZip(entries) {
+  const maskFiles = []
+  let manifestEntry = null
+  for (const e of entries) {
+    if (inFolder(e.relativePath, 'masks')) {
+      maskFiles.push({ ...e, file: e.blob })
+    } else if (e.name === 'seg_coco.json') {
+      manifestEntry = e
+    }
+  }
+  if (!manifestEntry) {
+    throw new Error('SAM-assisted dataset zip: no annotations/seg_coco.json found.')
+  }
+  return {
+    maskFiles,
+    samManifestJson: JSON.parse(await manifestEntry.blob.text()),
+  }
+}
+
+// Top-level entry point for one split at a time: both zips' entries in,
+// plus the split name (typed/picked by the person, since it can't be read
+// from folder structure anymore), one plan out. Reuses
+// buildUploadPlanForSplit, which is already split-agnostic.
+export async function buildSingleSplitUploadPlan({ originalEntries, samEntries, split }) {
+  const cleanSplit = String(split ?? '').trim()
+  if (!cleanSplit) {
+    throw new Error('A split name is required (e.g. train, val, test).')
+  }
+
+  const [{ photoFiles, originalManifestJson }, { maskFiles, samManifestJson }] = await Promise.all(
+    [classifySingleOriginalZip(originalEntries), classifySingleSamZip(samEntries)],
+  )
+
+  return {
+    split: cleanSplit,
+    ...buildUploadPlanForSplit({ photoFiles, maskFiles, originalManifestJson, samManifestJson }),
+  }
+}
+
 // Top-level entry point: both zips' entries in, one plan per split out.
 // Only splits present in BOTH zips are processed; a split found in only one
 // is reported rather than silently skipped, since that usually means a
