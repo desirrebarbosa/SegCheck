@@ -5,10 +5,21 @@ import MaskOverlay from '../components/MaskOverlay'
 import { getClassColors, setClassColor, defaultColorFor } from '../lib/classColors'
 import { useToast } from '../components/Toast'
 
+// How many pending masks to hold in the local queue at once, and how close
+// to the end of it we get before quietly fetching more (so Next never has
+// to block on a network round trip in the common case).
+const QUEUE_BATCH_SIZE = 25
+const REFILL_THRESHOLD = 5
+
+const MASK_COLUMNS = `id, manifest_mask_id, storage_path, category, bbox, segmentation, is_crowd,
+         photo_id, photo_filename, photo_storage_path, created_at`
+
 export default function ReviewQueue() {
   const { projectId } = useOutletContext()
   const { showError, showSuccess } = useToast()
-  const [mask, setMask] = useState(undefined)
+  const [queue, setQueue] = useState([])
+  const [queueIndex, setQueueIndex] = useState(0)
+  const [queueLoading, setQueueLoading] = useState(true)
   const [position, setPosition] = useState(null) // { index, total } within the current photo
   const [busy, setBusy] = useState(false)
   const [counts, setCounts] = useState(null)
@@ -19,38 +30,66 @@ export default function ReviewQueue() {
   // Opacity resets every session, per your call — no persistence.
   const [opacities, setOpacities] = useState({ photo: 1, mask: 0.5, polygon: 0.35, bbox: 1 })
 
-  const loadNext = useCallback(async () => {
-    setMask(undefined)
-    setPosition(null)
+  // undefined = still loading the first batch, null = queue genuinely empty
+  const mask = queue.length > 0 ? queue[queueIndex] : queueLoading ? undefined : null
+
+  const loadQueue = useCallback(async () => {
+    setQueueLoading(true)
     const { data, error } = await supabase
       .from('active_masks')
-      .select(
-        `id, manifest_mask_id, storage_path, category, bbox, segmentation, is_crowd,
-         photo_id, photo_filename, photo_storage_path`,
-      )
+      .select(MASK_COLUMNS)
       .eq('project_id', projectId)
       .eq('status', 'pending')
       .order('created_at', { ascending: true })
-      .limit(1)
+      .limit(QUEUE_BATCH_SIZE)
+    setQueueLoading(false)
     if (error) {
-      console.error('loadNext failed:', error)
+      console.error('loadQueue failed:', error)
       showError('Could not load the review queue.')
       return
     }
-    const next = data?.[0] ?? null
-    setMask(next)
-    if (next) {
-      const { data: siblings } = await supabase
-        .from('active_masks')
-        .select('id')
-        .eq('photo_id', next.photo_id)
-        .order('created_at', { ascending: true })
-      if (siblings) {
-        const idx = siblings.findIndex((s) => s.id === next.id)
-        setPosition({ index: idx + 1, total: siblings.length })
-      }
-    }
+    setQueue(data ?? [])
+    setQueueIndex(0)
   }, [projectId, showError])
+
+  const fetchMore = useCallback(
+    async (afterCreatedAt) => {
+      const { data, error } = await supabase
+        .from('active_masks')
+        .select(MASK_COLUMNS)
+        .eq('project_id', projectId)
+        .eq('status', 'pending')
+        .gt('created_at', afterCreatedAt)
+        .order('created_at', { ascending: true })
+        .limit(QUEUE_BATCH_SIZE)
+      if (error) {
+        console.error('fetchMore failed:', error)
+        return []
+      }
+      return data ?? []
+    },
+    [projectId],
+  )
+
+  // Quietly top up the queue once we're getting close to the end of what's
+  // loaded, so Prev/Next feel instant instead of stalling on a fetch.
+  useEffect(() => {
+    if (queue.length === 0) return
+    if (queueIndex < queue.length - REFILL_THRESHOLD) return
+    const last = queue[queue.length - 1]
+    let cancelled = false
+    fetchMore(last.created_at).then((more) => {
+      if (cancelled || more.length === 0) return
+      setQueue((q) => {
+        const existingIds = new Set(q.map((m) => m.id))
+        const fresh = more.filter((m) => !existingIds.has(m.id))
+        return fresh.length ? [...q, ...fresh] : q
+      })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [queueIndex, queue, fetchMore])
 
   const loadCounts = useCallback(async () => {
     const { data, error } = await supabase
@@ -69,12 +108,46 @@ export default function ReviewQueue() {
   }, [projectId])
 
   useEffect(() => {
-    loadNext()
+    loadQueue()
     loadCounts()
     getClassColors(projectId)
       .then(setClassColors)
       .catch((e) => console.error('getClassColors failed:', e))
-  }, [loadNext, loadCounts, projectId])
+  }, [loadQueue, loadCounts, projectId])
+
+  // "instance X of Y" within the current photo — recomputed whenever the
+  // displayed mask changes, whether that's from Prev/Next or a decision.
+  useEffect(() => {
+    if (!mask) {
+      setPosition(null)
+      return
+    }
+    let cancelled = false
+    supabase
+      .from('active_masks')
+      .select('id')
+      .eq('photo_id', mask.photo_id)
+      .order('created_at', { ascending: true })
+      .then(({ data }) => {
+        if (cancelled || !data) return
+        const idx = data.findIndex((s) => s.id === mask.id)
+        setPosition({ index: idx + 1, total: data.length })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [mask?.id, mask?.photo_id])
+
+  const canGoPrev = queueIndex > 0
+  const canGoNext = queueIndex < queue.length - 1
+
+  function goPrev() {
+    setQueueIndex((i) => Math.max(0, i - 1))
+  }
+
+  function goNext() {
+    setQueueIndex((i) => Math.min(queue.length - 1, i + 1))
+  }
 
   async function decide(status) {
     if (!mask) return
@@ -97,7 +170,14 @@ export default function ReviewQueue() {
         status_before: 'pending',
         status_after: status,
       })
-      await Promise.all([loadNext(), loadCounts()])
+      // Drop the reviewed mask from the local queue — the item that was
+      // next in line slides into this same index, so we stay put rather
+      // than jumping the view.
+      const decidedIndex = queueIndex
+      const nextQueue = [...queue.slice(0, decidedIndex), ...queue.slice(decidedIndex + 1)]
+      setQueue(nextQueue)
+      setQueueIndex(Math.min(decidedIndex, Math.max(0, nextQueue.length - 1)))
+      await loadCounts()
     } catch (e) {
       console.error('decide failed:', e)
       showError('Could not save that decision — please try again.')
@@ -171,6 +251,33 @@ export default function ReviewQueue() {
               bboxColor={colorsFor(mask.category).bbox}
               polygonColor={colorsFor(mask.category).polygon}
             />
+
+            <div className="flex items-center justify-center gap-2">
+              <div className="flex items-center gap-1 rounded-full border border-[#E5E4DF] bg-white p-1 shadow-sm">
+                <button
+                  disabled={!canGoPrev}
+                  onClick={goPrev}
+                  aria-label="Previous unsure image"
+                  title="Not sure yet — go back"
+                  className="flex h-8 w-8 items-center justify-center rounded-full text-[#5F5E5A] transition hover:bg-[#F1EFE8] disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  <i className="ti ti-chevron-left text-base" aria-hidden="true"></i>
+                </button>
+                <span className="min-w-[3.5rem] px-1 text-center text-xs tabular-nums text-[#888780]">
+                  {queueIndex + 1} of {counts?.pending ?? queue.length}
+                </span>
+                <button
+                  disabled={!canGoNext}
+                  onClick={goNext}
+                  aria-label="Skip to next, come back later"
+                  title="Not sure yet — skip for now"
+                  className="flex h-8 w-8 items-center justify-center rounded-full text-[#5F5E5A] transition hover:bg-[#F1EFE8] disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  <i className="ti ti-chevron-right text-base" aria-hidden="true"></i>
+                </button>
+              </div>
+              <span className="text-xs text-[#888780]">Not sure? Skip and come back to it</span>
+            </div>
 
             <div className="flex gap-2">
               <button
