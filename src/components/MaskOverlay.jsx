@@ -10,7 +10,11 @@ import { decodeCocoRLE, isRLE } from '../lib/rle'
 //      opacities.polygon)
 //   4. the bbox rectangle, stroked with bboxColor (opacity: opacities.bbox)
 // Zoom: scroll to zoom (matches CVAT's own convention), buttons as a
-// fallback for trackpads/mobile. Resets to 100% on a new mask.
+// fallback for trackpads/mobile. Zooming keeps whatever point is under the
+// cursor (or the container center, for the +/- buttons) fixed on screen,
+// instead of always expanding from a static center. Once zoomed in, drag
+// (mouse or touch) to pan/focus on a different part of the photo. Resets
+// to 100% + centered on a new mask.
 export default function MaskOverlay({
   photoPath,
   maskPath,
@@ -21,12 +25,17 @@ export default function MaskOverlay({
   polygonColor = '#1D9E75',
 }) {
   const canvasRef = useRef(null)
+  const containerRef = useRef(null)
   const [error, setError] = useState(null)
   const [zoom, setZoom] = useState(1)
+  const [pan, setPan] = useState({ x: 0, y: 0 })
+  const [isDragging, setIsDragging] = useState(false)
+  const dragRef = useRef(null)
   const imagesRef = useRef({ photo: null, mask: null })
 
   useEffect(() => {
     setZoom(1)
+    setPan({ x: 0, y: 0 })
   }, [photoPath, maskPath])
 
   const rle = useMemo(() => {
@@ -133,39 +142,135 @@ export default function MaskOverlay({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [photoPath, maskPath, bbox, rle, segmentation, opacities, bboxColor, polygonColor])
 
+  // Keeps the photo from being dragged/zoomed fully out of view — allows
+  // panning until the edge is `slack` px past the container edge, rather
+  // than clamping tight to zero overlap.
+  function clampPan(panX, panY, z) {
+    const canvas = canvasRef.current
+    const container = containerRef.current
+    if (!canvas || !container) return { x: panX, y: panY }
+    const slack = 80
+    const maxX = Math.max(0, (canvas.width * z - container.clientWidth) / 2) + slack
+    const maxY = Math.max(0, (canvas.height * z - container.clientHeight) / 2) + slack
+    return {
+      x: Math.min(maxX, Math.max(-maxX, panX)),
+      y: Math.min(maxY, Math.max(-maxY, panY)),
+    }
+  }
+
+  // Zooms to `nextZoom` while keeping the point at (containerX, containerY)
+  // — coordinates relative to the container's top-left — fixed on screen.
+  // The canvas is centered in the container at pan (0,0), so its center
+  // (pre-pan) is always the container's own center.
+  function zoomTowardPoint(nextZoom, containerX, containerY) {
+    const canvas = canvasRef.current
+    const container = containerRef.current
+    if (!canvas || !container) {
+      setZoom(nextZoom)
+      return
+    }
+    const boxCenterX = container.clientWidth / 2
+    const boxCenterY = container.clientHeight / 2
+    const nativeX = (containerX - boxCenterX - pan.x) / zoom + canvas.width / 2
+    const nativeY = (containerY - boxCenterY - pan.y) / zoom + canvas.height / 2
+    const nextPan = clampPan(
+      containerX - boxCenterX - nextZoom * (nativeX - canvas.width / 2),
+      containerY - boxCenterY - nextZoom * (nativeY - canvas.height / 2),
+      nextZoom
+    )
+    setZoom(nextZoom)
+    setPan(nextPan)
+  }
+
+  function zoomBy(delta) {
+    const container = containerRef.current
+    const nextZoom = Math.min(4, Math.max(0.5, zoom + delta))
+    zoomTowardPoint(nextZoom, container.clientWidth / 2, container.clientHeight / 2)
+  }
+
+  function resetView() {
+    setZoom(1)
+    setPan({ x: 0, y: 0 })
+  }
+
   function onWheel(e) {
     e.preventDefault()
-    setZoom((z) => Math.min(4, Math.max(0.5, z - e.deltaY * 0.001)))
+    const rect = containerRef.current.getBoundingClientRect()
+    const nextZoom = Math.min(4, Math.max(0.5, zoom - e.deltaY * 0.001))
+    zoomTowardPoint(nextZoom, e.clientX - rect.left, e.clientY - rect.top)
+  }
+
+  // Drag-to-pan — only active once zoomed in, since there's nothing to
+  // reposition at 100%. Uses pointer capture so dragging still tracks the
+  // photo even if the cursor leaves the container mid-drag.
+  function onPointerDown(e) {
+    if (zoom <= 1) return
+    e.currentTarget.setPointerCapture(e.pointerId)
+    dragRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      startPanX: pan.x,
+      startPanY: pan.y,
+    }
+    setIsDragging(true)
+  }
+
+  function onPointerMove(e) {
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    setPan(
+      clampPan(
+        drag.startPanX + (e.clientX - drag.startX),
+        drag.startPanY + (e.clientY - drag.startY),
+        zoom
+      )
+    )
+  }
+
+  function endDrag(e) {
+    if (dragRef.current && dragRef.current.pointerId === e.pointerId) {
+      dragRef.current = null
+      setIsDragging(false)
+    }
   }
 
   if (error) return <p className="text-sm text-[#791F1F]">{error}</p>
 
   return (
     <div
+      ref={containerRef}
       onWheel={onWheel}
-      className="relative overflow-auto rounded-lg border border-[#E5E4DF] bg-[#F1EFE8]"
-      style={{ height: '60vh' }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      className="relative overflow-hidden rounded-lg border border-[#E5E4DF] bg-[#F1EFE8]"
+      style={{ height: '60vh', cursor: zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default' }}
     >
-      <div className="flex min-h-full items-center justify-center p-2">
+      <div className="flex h-full w-full items-center justify-center p-2">
         <canvas
           ref={canvasRef}
-          style={{ transform: `scale(${zoom})`, transformOrigin: 'center' }}
-          className="max-w-none"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: 'center',
+          }}
+          className="max-w-none touch-none"
         />
       </div>
       <div className="absolute bottom-2 right-2 flex gap-1 rounded-lg border border-[#E5E4DF] bg-white p-1">
         <button
-          onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
+          onClick={() => zoomBy(-0.25)}
           aria-label="Zoom out"
           className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5]"
         >
           <i className="ti ti-minus text-sm" aria-hidden="true"></i>
         </button>
-        <button onClick={() => setZoom(1)} className="rounded-md px-2 text-xs hover:bg-[#F7F7F5]">
+        <button onClick={resetView} className="rounded-md px-2 text-xs hover:bg-[#F7F7F5]">
           {Math.round(zoom * 100)}%
         </button>
         <button
-          onClick={() => setZoom((z) => Math.min(4, z + 0.25))}
+          onClick={() => zoomBy(0.25)}
           aria-label="Zoom in"
           className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5]"
         >
