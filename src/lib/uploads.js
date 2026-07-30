@@ -1,16 +1,13 @@
 import { supabase } from './supabaseClient'
 import { uploadFile } from './storage'
+import { makeThumbnail } from './thumbnails'
 
-// Commits a buildUploadPlan() result (see manifest.js) to Supabase:
-//   - finds or creates each photo (re-upload of an existing filename bumps
-//     photos.latest_version instead of duplicating the row)
-//   - creates the photo_version (batch) for this upload
-//   - a photo missing from the manifest entirely -> one auto-fail mask row
-//   - one mask row per manifest instance, uploading its file if present,
-//     auto-failing (status='fail') the ones with no matching mask file
-//   - writes review_logs for every state change
-// Returns a small summary object for the UI.
-export async function commitUploadPlan({ projectId, userId, plan }) {
+// Commits ONE split's plan (from buildUploadPlanForSplit / the `plan` array
+// inside a buildMultiSplitUploadPlan() result) to Supabase. Same behavior as
+// before, plus: photos are now found/created scoped to project+split+
+// filename (a filename can repeat across splits), and `split` is stored on
+// the photo row.
+async function commitSplitPlan({ projectId, split, userId, plan }) {
   const summary = { photosCreated: 0, photosVersioned: 0, masksCreated: 0, autoFailed: 0 }
 
   for (const item of plan) {
@@ -20,21 +17,37 @@ export async function commitUploadPlan({ projectId, userId, plan }) {
       .from('photos')
       .select('*')
       .eq('project_id', projectId)
+      .eq('split', split)
       .eq('filename', filename)
       .maybeSingle()
     if (findErr) throw findErr
 
     let photo = existing
-    const photoPath = `${projectId}/photos/${item.stem}-${item.photo.name}`
+    const photoPath = `${projectId}/${split}/photos/${item.stem}-${item.photo.name}`
 
     if (!photo) {
       await uploadFile(photoPath, item.photo.blob ?? item.photo.file)
+
+      let thumbnailPath = null
+      try {
+        const thumbBlob = await makeThumbnail(item.photo.blob ?? item.photo.file)
+        thumbnailPath = `${projectId}/${split}/thumbs/${item.stem}.jpg`
+        await uploadFile(thumbnailPath, thumbBlob)
+      } catch (e) {
+        // Non-fatal: the photo itself already uploaded fine. A missing
+        // thumbnail just means the manage-photos list falls back to no
+        // preview for this one row, not a failed upload.
+        console.error('Thumbnail generation failed for', filename, e)
+      }
+
       const { data: created, error: insErr } = await supabase
         .from('photos')
         .insert({
           project_id: projectId,
+          split,
           filename,
           storage_path: photoPath,
+          thumbnail_path: thumbnailPath,
           latest_version: 1,
           uploaded_by: userId,
         })
@@ -48,7 +61,7 @@ export async function commitUploadPlan({ projectId, userId, plan }) {
         photo_id: photo.id,
         reviewer_id: userId,
         action: 'upload_photo',
-        detail: { filename },
+        detail: { filename, split },
       })
     } else {
       const nextVersion = existing.latest_version + 1
@@ -77,10 +90,9 @@ export async function commitUploadPlan({ projectId, userId, plan }) {
       photo_id: photo.id,
       reviewer_id: userId,
       action: 'upload_version',
-      detail: { version_number: version.version_number },
+      detail: { version_number: version.version_number, split },
     })
 
-    // Whole photo absent from the manifest -> nothing to review, auto-fail.
     if (item.missingWhole) {
       const { error: mErr } = await supabase.from('masks').insert({
         photo_version_id: version.id,
@@ -97,7 +109,7 @@ export async function commitUploadPlan({ projectId, userId, plan }) {
         reviewer_id: userId,
         action: 'auto_fail_missing',
         status_after: 'fail',
-        detail: { reason: 'photo not present in manifest' },
+        detail: { reason: 'photo not present in SAM-assisted manifest', split },
       })
       continue
     }
@@ -105,7 +117,7 @@ export async function commitUploadPlan({ projectId, userId, plan }) {
     for (const inst of item.instances) {
       let maskPath = null
       if (inst.mask) {
-        maskPath = `${projectId}/masks/${item.stem}/${inst.annotationId}-${inst.mask.name}`
+        maskPath = `${projectId}/${split}/masks/${item.stem}/${inst.annotationId}-${inst.mask.name}`
         await uploadFile(maskPath, inst.mask.blob ?? inst.mask.file)
       }
 
@@ -137,11 +149,27 @@ export async function commitUploadPlan({ projectId, userId, plan }) {
           reviewer_id: userId,
           action: 'auto_fail_missing',
           status_after: 'fail',
-          detail: { annotation_id: inst.annotationId, reason: 'no matching mask file' },
+          detail: { annotation_id: inst.annotationId, reason: 'no matching mask file', split },
         })
       }
     }
   }
 
   return summary
+}
+
+// Commits every split in a buildMultiSplitUploadPlan() result. Returns
+// summaries keyed by split, plus a combined total for a quick top-line
+// number in the UI.
+export async function commitMultiSplitPlan({ projectId, userId, bySplit }) {
+  const perSplit = {}
+  const total = { photosCreated: 0, photosVersioned: 0, masksCreated: 0, autoFailed: 0 }
+
+  for (const [split, { plan }] of bySplit) {
+    const summary = await commitSplitPlan({ projectId, split, userId, plan })
+    perSplit[split] = summary
+    for (const key of Object.keys(total)) total[key] += summary[key]
+  }
+
+  return { perSplit, total }
 }
