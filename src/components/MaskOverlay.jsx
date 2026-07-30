@@ -1,6 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getSignedUrl } from '../lib/storage'
 import { decodeCocoRLE, isRLE } from '../lib/rle'
+
+const MAX_HEIGHT_VH = 0.65 // container never taller than 65% of viewport height
+const MAX_ZOOM = 4 // multiplier ON TOP of fit — i.e. 4x more zoomed in than fit
 
 // Draws, layered on one canvas at native photo resolution:
 //   1. the photo (opacity: opacities.photo)
@@ -9,12 +12,18 @@ import { decodeCocoRLE, isRLE } from '../lib/rle'
 //      or a plain polygon array — filled with polygonColor (opacity:
 //      opacities.polygon)
 //   4. the bbox rectangle, stroked with bboxColor (opacity: opacities.bbox)
-// Zoom: scroll to zoom (matches CVAT's own convention), buttons as a
-// fallback for trackpads/mobile. Zooming keeps whatever point is under the
-// cursor (or the container center, for the +/- buttons) fixed on screen,
-// instead of always expanding from a static center. Once zoomed in, drag
-// (mouse or touch) to pan/focus on a different part of the photo. Resets
-// to 100% + centered on a new mask.
+//
+// Sizing: `fitScale` is computed from the photo's natural dimensions vs the
+// available container width and a max-height budget, so the container's
+// rendered size actually matches the image's aspect ratio instead of a
+// fixed box the image floats around in. `zoom` is a multiplier ON TOP of
+// that fit — zoom=1 always means "fully visible, correctly proportioned",
+// so zooming out below that is disallowed (there's nothing useful past
+// fully-visible) and zooming in goes up to MAX_ZOOM beyond fit.
+//
+// Panning: once zoomed in beyond fit, drag (mouse or touch) to reposition.
+// Zoom (scroll or +/- buttons) keeps whatever point is under the cursor (or
+// the container center, for the buttons) fixed on screen.
 export default function MaskOverlay({
   photoPath,
   maskPath,
@@ -26,10 +35,13 @@ export default function MaskOverlay({
 }) {
   const canvasRef = useRef(null)
   const containerRef = useRef(null)
+  const wrapperRef = useRef(null) // outer, full-width element used to measure available space
   const [error, setError] = useState(null)
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [isDragging, setIsDragging] = useState(false)
+  const [naturalSize, setNaturalSize] = useState(null) // { width, height } of the loaded photo
+  const [availableWidth, setAvailableWidth] = useState(0)
   const dragRef = useRef(null)
   const imagesRef = useRef({ photo: null, mask: null })
 
@@ -37,6 +49,28 @@ export default function MaskOverlay({
     setZoom(1)
     setPan({ x: 0, y: 0 })
   }, [photoPath, maskPath])
+
+  // Measure available width so fitScale reflects the actual layout, not a
+  // guess — updates on window resize / sidebar toggles too.
+  useLayoutEffect(() => {
+    const el = wrapperRef.current
+    if (!el) return
+    const observer = new ResizeObserver((entries) => {
+      setAvailableWidth(entries[0].contentRect.width)
+    })
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  const fitScale = useMemo(() => {
+    if (!naturalSize || availableWidth === 0) return 1
+    const maxHeightPx = window.innerHeight * MAX_HEIGHT_VH
+    const scale = Math.min(availableWidth / naturalSize.width, maxHeightPx / naturalSize.height, 1)
+    return scale > 0 ? scale : 1
+  }, [naturalSize, availableWidth])
+
+  const baseWidth = naturalSize ? naturalSize.width * fitScale : 0
+  const baseHeight = naturalSize ? naturalSize.height * fitScale : 0
 
   const rle = useMemo(() => {
     if (!segmentation || !isRLE(segmentation)) return null
@@ -68,6 +102,8 @@ export default function MaskOverlay({
         }
         imagesRef.current = { photo, mask }
         if (!alive) return
+
+        setNaturalSize({ width: photo.naturalWidth, height: photo.naturalHeight })
 
         const canvas = canvasRef.current
         const ctx = canvas.getContext('2d')
@@ -144,14 +180,15 @@ export default function MaskOverlay({
 
   // Keeps the photo from being dragged/zoomed fully out of view — allows
   // panning until the edge is `slack` px past the container edge, rather
-  // than clamping tight to zero overlap.
+  // than clamping tight to zero overlap. Uses baseWidth/baseHeight (the
+  // fit-scaled size) rather than the canvas's raw pixel buffer size, since
+  // those are no longer the same thing now that fitScale exists.
   function clampPan(panX, panY, z) {
-    const canvas = canvasRef.current
     const container = containerRef.current
-    if (!canvas || !container) return { x: panX, y: panY }
+    if (!container || !naturalSize) return { x: panX, y: panY }
     const slack = 80
-    const maxX = Math.max(0, (canvas.width * z - container.clientWidth) / 2) + slack
-    const maxY = Math.max(0, (canvas.height * z - container.clientHeight) / 2) + slack
+    const maxX = Math.max(0, (baseWidth * z - container.clientWidth) / 2) + slack
+    const maxY = Math.max(0, (baseHeight * z - container.clientHeight) / 2) + slack
     return {
       x: Math.min(maxX, Math.max(-maxX, panX)),
       y: Math.min(maxY, Math.max(-maxY, panY)),
@@ -160,23 +197,20 @@ export default function MaskOverlay({
 
   // Zooms to `nextZoom` while keeping the point at (containerX, containerY)
   // — coordinates relative to the container's top-left — fixed on screen.
-  // The canvas is centered in the container at pan (0,0), so its center
-  // (pre-pan) is always the container's own center.
   function zoomTowardPoint(nextZoom, containerX, containerY) {
-    const canvas = canvasRef.current
     const container = containerRef.current
-    if (!canvas || !container) {
+    if (!container || !naturalSize) {
       setZoom(nextZoom)
       return
     }
     const boxCenterX = container.clientWidth / 2
     const boxCenterY = container.clientHeight / 2
-    const nativeX = (containerX - boxCenterX - pan.x) / zoom + canvas.width / 2
-    const nativeY = (containerY - boxCenterY - pan.y) / zoom + canvas.height / 2
+    const localX = (containerX - boxCenterX - pan.x) / zoom + baseWidth / 2
+    const localY = (containerY - boxCenterY - pan.y) / zoom + baseHeight / 2
     const nextPan = clampPan(
-      containerX - boxCenterX - nextZoom * (nativeX - canvas.width / 2),
-      containerY - boxCenterY - nextZoom * (nativeY - canvas.height / 2),
-      nextZoom
+      containerX - boxCenterX - nextZoom * (localX - baseWidth / 2),
+      containerY - boxCenterY - nextZoom * (localY - baseHeight / 2),
+      nextZoom,
     )
     setZoom(nextZoom)
     setPan(nextPan)
@@ -184,7 +218,10 @@ export default function MaskOverlay({
 
   function zoomBy(delta) {
     const container = containerRef.current
-    const nextZoom = Math.min(4, Math.max(0.5, zoom + delta))
+    // Minimum is 1 (= fully fit, nothing useful past that), not an
+    // arbitrary small fraction — this is the actual fix for "there should
+    // be a minimum to zooming out".
+    const nextZoom = Math.min(MAX_ZOOM, Math.max(1, zoom + delta))
     zoomTowardPoint(nextZoom, container.clientWidth / 2, container.clientHeight / 2)
   }
 
@@ -193,15 +230,26 @@ export default function MaskOverlay({
     setPan({ x: 0, y: 0 })
   }
 
-  function onWheel(e) {
-    e.preventDefault()
-    const rect = containerRef.current.getBoundingClientRect()
-    const nextZoom = Math.min(4, Math.max(0.5, zoom - e.deltaY * 0.001))
-    zoomTowardPoint(nextZoom, e.clientX - rect.left, e.clientY - rect.top)
-  }
+  // Native (non-passive) wheel listener. React's onWheel prop is attached
+  // as a passive listener, so calling preventDefault() inside it throws
+  // "Unable to preventDefault inside passive event listener invocation" —
+  // this is the actual fix, not just moving the same call elsewhere.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    function handleWheel(e) {
+      e.preventDefault()
+      const rect = el.getBoundingClientRect()
+      const nextZoom = Math.min(MAX_ZOOM, Math.max(1, zoom - e.deltaY * 0.001))
+      zoomTowardPoint(nextZoom, e.clientX - rect.left, e.clientY - rect.top)
+    }
+    el.addEventListener('wheel', handleWheel, { passive: false })
+    return () => el.removeEventListener('wheel', handleWheel)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoom, pan, baseWidth, baseHeight])
 
   // Drag-to-pan — only active once zoomed in, since there's nothing to
-  // reposition at 100%. Uses pointer capture so dragging still tracks the
+  // reposition at fit. Uses pointer capture so dragging still tracks the
   // photo even if the cursor leaves the container mid-drag.
   function onPointerDown(e) {
     if (zoom <= 1) return
@@ -223,8 +271,8 @@ export default function MaskOverlay({
       clampPan(
         drag.startPanX + (e.clientX - drag.startX),
         drag.startPanY + (e.clientY - drag.startY),
-        zoom
-      )
+        zoom,
+      ),
     )
   }
 
@@ -238,44 +286,52 @@ export default function MaskOverlay({
   if (error) return <p className="text-sm text-[#791F1F]">{error}</p>
 
   return (
-    <div
-      ref={containerRef}
-      onWheel={onWheel}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
-      className="relative overflow-hidden rounded-lg border border-[#E5E4DF] bg-[#F1EFE8]"
-      style={{ height: '60vh', cursor: zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default' }}
-    >
-      <div className="flex h-full w-full items-center justify-center p-2">
-        <canvas
-          ref={canvasRef}
-          style={{
-            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-            transformOrigin: 'center',
-          }}
-          className="max-w-none touch-none"
-        />
-      </div>
-      <div className="absolute bottom-2 right-2 flex gap-1 rounded-lg border border-[#E5E4DF] bg-white p-1">
-        <button
-          onClick={() => zoomBy(-0.25)}
-          aria-label="Zoom out"
-          className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5]"
-        >
-          <i className="ti ti-minus text-sm" aria-hidden="true"></i>
-        </button>
-        <button onClick={resetView} className="rounded-md px-2 text-xs hover:bg-[#F7F7F5]">
-          {Math.round(zoom * 100)}%
-        </button>
-        <button
-          onClick={() => zoomBy(0.25)}
-          aria-label="Zoom in"
-          className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5]"
-        >
-          <i className="ti ti-plus text-sm" aria-hidden="true"></i>
-        </button>
+    <div ref={wrapperRef} className="flex w-full justify-center">
+      <div
+        ref={containerRef}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        className="relative overflow-hidden rounded-lg border border-[#E5E4DF] bg-[#F1EFE8]"
+        style={{
+          width: baseWidth || '100%',
+          height: baseHeight || 320,
+          cursor: zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default',
+        }}
+      >
+        <div className="flex h-full w-full items-center justify-center">
+          <canvas
+            ref={canvasRef}
+            style={{
+              width: baseWidth,
+              height: baseHeight,
+              transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+              transformOrigin: 'center',
+            }}
+            className="touch-none"
+          />
+        </div>
+        <div className="absolute bottom-2 right-2 flex gap-1 rounded-lg border border-[#E5E4DF] bg-white p-1">
+          <button
+            onClick={() => zoomBy(-0.25)}
+            disabled={zoom <= 1}
+            aria-label="Zoom out"
+            className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5] disabled:opacity-40"
+          >
+            <i className="ti ti-minus text-sm" aria-hidden="true"></i>
+          </button>
+          <button onClick={resetView} className="rounded-md px-2 text-xs hover:bg-[#F7F7F5]">
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            onClick={() => zoomBy(0.25)}
+            aria-label="Zoom in"
+            className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5]"
+          >
+            <i className="ti ti-plus text-sm" aria-hidden="true"></i>
+          </button>
+        </div>
       </div>
     </div>
   )
