@@ -5,6 +5,8 @@ COCO-format dataset: upload a dataset zip, walk through each detected
 instance (bbox + mask), and pass/fail it — then export results as CSV or a
 "redo" zip of everything that failed.
 
+Built as a research tool for my current thesis.
+
 ## Setup
 
 ```bash
