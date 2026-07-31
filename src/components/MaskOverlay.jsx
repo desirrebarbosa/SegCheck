@@ -286,7 +286,7 @@ export default function MaskOverlay({
   if (error) return <p className="text-sm text-[#791F1F]">{error}</p>
 
   return (
-    <div ref={wrapperRef} className="flex w-full justify-center">
+    <div ref={wrapperRef} className="flex w-full flex-col items-center gap-2">
       <div
         ref={containerRef}
         onPointerDown={onPointerDown}
@@ -312,26 +312,29 @@ export default function MaskOverlay({
             className="touch-none"
           />
         </div>
-        <div className="absolute bottom-2 right-2 flex gap-1 rounded-lg border border-[#E5E4DF] bg-white p-1">
-          <button
-            onClick={() => zoomBy(-0.25)}
-            disabled={zoom <= 1}
-            aria-label="Zoom out"
-            className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5] disabled:opacity-40"
-          >
-            <i className="ti ti-minus text-sm" aria-hidden="true"></i>
-          </button>
-          <button onClick={resetView} className="rounded-md px-2 text-xs hover:bg-[#F7F7F5]">
-            {Math.round(zoom * 100)}%
-          </button>
-          <button
-            onClick={() => zoomBy(0.25)}
-            aria-label="Zoom in"
-            className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5]"
-          >
-            <i className="ti ti-plus text-sm" aria-hidden="true"></i>
-          </button>
-        </div>
+      </div>
+
+      {/* Zoom controls live BELOW the image, not overlaid on top of it —
+          they were obstructing the actual content being reviewed. */}
+      <div className="flex items-center gap-1 rounded-lg border border-[#E5E4DF] bg-white p-1">
+        <button
+          onClick={() => zoomBy(-0.25)}
+          disabled={zoom <= 1}
+          aria-label="Zoom out"
+          className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5] disabled:opacity-40"
+        >
+          <i className="ti ti-minus text-sm" aria-hidden="true"></i>
+        </button>
+        <button onClick={resetView} className="w-14 rounded-md px-2 text-xs hover:bg-[#F7F7F5]">
+          {Math.round(zoom * 100)}%
+        </button>
+        <button
+          onClick={() => zoomBy(0.25)}
+          aria-label="Zoom in"
+          className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[#F7F7F5]"
+        >
+          <i className="ti ti-plus text-sm" aria-hidden="true"></i>
+        </button>
       </div>
     </div>
   )
