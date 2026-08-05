@@ -92,19 +92,42 @@ export default function ReviewQueue() {
   }, [queueIndex, queue, fetchMore])
 
   const loadCounts = useCallback(async () => {
-    const { data, error } = await supabase
-      .from('active_masks')
-      .select('status, category')
-      .eq('project_id', projectId)
-    if (error) return
-    const c = { pending: 0, pass: 0, fail: 0 }
-    const cats = new Set()
-    for (const row of data) {
-      c[row.status] = (c[row.status] ?? 0) + 1
-      if (row.category) cats.add(row.category)
+    // 1. Fetch exact counts without downloading the rows
+    const fetchCount = async (status) => {
+      const { count, error } = await supabase
+        .from('active_masks')
+        .select('*', { count: 'exact', head: true })
+        .eq('project_id', projectId)
+        .eq('status', status)
+      
+      if (error) console.error(`Failed to count ${status}:`, error)
+      return count || 0
     }
-    setCounts(c)
-    setCategories([...cats].sort())
+
+    const [pending, pass, fail] = await Promise.all([
+      fetchCount('pending'),
+      fetchCount('pass'),
+      fetchCount('fail')
+    ])
+
+    setCounts({ pending, pass, fail })
+
+    // 2. Handle categories separately
+    // Since we aren't downloading rows, we must fetch categories directly.
+    // Note: If you don't have a separate categories table, we fetch the 
+    // category column and manually deduplicate. 
+    const { data: catData, error: catError } = await supabase
+      .from('active_masks')
+      .select('category')
+      .eq('project_id', projectId)
+    
+    if (!catError && catData) {
+      const cats = new Set()
+      for (const row of catData) {
+        if (row.category) cats.add(row.category)
+      }
+      setCategories([...cats].sort())
+    }
   }, [projectId])
 
   useEffect(() => {
