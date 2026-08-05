@@ -63,6 +63,10 @@ export default function App() {
             <Route path="members" element={<Members />} />
           </Route>
         </Routes>
+        <div>
+          {/* ... */}
+          <Analytics />
+        </div>
       </BrowserRouter>
     </ToastProvider>
   )
