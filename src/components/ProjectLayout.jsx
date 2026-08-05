@@ -5,6 +5,7 @@ import { getProject, getMyMembership } from '../lib/projects'
 
 const links = [
   { to: '', label: 'Review', icon: 'ti-list-check', end: true },
+  { to: 'my-redo', label: 'My Redo', icon: 'ti-clipboard-list' },
   { to: 'upload', label: 'Upload', icon: 'ti-upload' },
   { to: 'dashboard', label: 'Dashboard', icon: 'ti-chart-bar' },
   { to: 'members', label: 'Members', icon: 'ti-users' },

@@ -76,13 +76,11 @@ export async function getMyMembership(projectId) {
 export async function listMembers(projectId) {
   const { data, error } = await supabase
     .from('project_members')
-    .select('is_lead, added_at, assigned_categories, reviewer:reviewers(id, email, display_name)')
+    .select('is_lead, added_at, reviewer:reviewers(id, email, display_name)')
     .eq('project_id', projectId)
   if (error) throw error
 
-  // Per-member count of fail masks currently assigned to them, for display
-  // next to their category chips. One query, tallied client-side rather
-  // than N queries (one per member).
+  // Per-member count of fail masks currently assigned to them.
   const { data: assigned, error: aErr } = await supabase
     .from('masks')
     .select('assigned_to')
@@ -97,13 +95,13 @@ export async function listMembers(projectId) {
 
   return data.map((m) => ({
     ...m,
-    assigned_categories: m.assigned_categories ?? [],
     redo_count: countsByReviewer.get(m.reviewer.id) ?? 0,
   }))
 }
 
-// Add an existing SegCheck account to the project by email.
-export async function addMemberByEmail(projectId, email, categories = []) {
+// Add an existing SegCheck account to the project by email, then give them
+// their share of whatever redo backlog is currently unassigned.
+export async function addMemberByEmail(projectId, email) {
   const clean = email.trim().toLowerCase()
   const { data: rev, error: e1 } = await supabase
     .from('reviewers')
@@ -116,40 +114,75 @@ export async function addMemberByEmail(projectId, email, categories = []) {
       `No SegCheck account for ${clean}. They must sign in once before you can add them.`,
     )
 
-  const { error: e2 } = await supabase.from('project_members').insert({
-    project_id: projectId,
-    reviewer_id: rev.id,
-    is_lead: false,
-    assigned_categories: categories,
-  })
+  const { error: e2 } = await supabase
+    .from('project_members')
+    .insert({ project_id: projectId, reviewer_id: rev.id, is_lead: false })
   if (e2) {
     if (e2.code === '23505') throw new Error(`${clean} is already a member.`)
     throw e2
   }
 
-  if (categories.length > 0) {
-    return distributeRedoMasks(projectId, rev.id, categories)
-  }
-  return 0
+  const { perMember } = await rebalanceRedoAssignments(projectId)
+  return perMember[rev.id] ?? 0
 }
 
-// Assigns unassigned (assigned_to is null) fail masks in the given
-// categories to reviewerId. Never reassigns another member's already-
-// assigned work — only claims masks nobody's on the hook for yet. Returns
-// the count assigned, for the "N redo items assigned" toast.
-export async function distributeRedoMasks(projectId, reviewerId, categories) {
-  if (!categories || categories.length === 0) return 0
+// Evenly splits every currently UNASSIGNED fail mask across all current
+// project members, round-robin, so the backlog divides as equally as
+// possible (e.g. 190 unassigned / 4 members -> ~47-48 each). Never touches
+// a mask that's already assigned to someone — this only distributes the
+// unclaimed pool, whether that's the first distribution after a member is
+// added or fresh fail masks from a new upload. Category is no longer a
+// factor in who gets what (was, in an earlier version of this feature —
+// replaced per direct instruction: split by count, not by class).
+export async function rebalanceRedoAssignments(projectId) {
+  const { data: members, error: mErr } = await supabase
+    .from('project_members')
+    .select('reviewer_id')
+    .eq('project_id', projectId)
+  if (mErr) throw mErr
+  if (members.length === 0) return { assigned: 0, perMember: {} }
 
-  const { data, error } = await supabase
+  const { data: unassigned, error: uErr } = await supabase
     .from('masks')
-    .update({ assigned_to: reviewerId })
+    .select('id')
     .eq('project_id', projectId)
     .eq('status', 'fail')
-    .in('category', categories)
     .is('assigned_to', null)
-    .select('id')
+  if (uErr) throw uErr
+  if (unassigned.length === 0) return { assigned: 0, perMember: {} }
+
+  const byReviewer = new Map()
+  unassigned.forEach((mask, i) => {
+    const reviewerId = members[i % members.length].reviewer_id
+    if (!byReviewer.has(reviewerId)) byReviewer.set(reviewerId, [])
+    byReviewer.get(reviewerId).push(mask.id)
+  })
+
+  const perMember = {}
+  for (const [reviewerId, ids] of byReviewer) {
+    const { error } = await supabase.from('masks').update({ assigned_to: reviewerId }).in('id', ids)
+    if (error) throw error
+    perMember[reviewerId] = ids.length
+  }
+
+  return { assigned: unassigned.length, perMember }
+}
+
+// Read-only: the redo (fail) masks currently assigned to one reviewer, for
+// the dedicated "My Redo" list.
+export async function fetchMyRedoAssignments(projectId, reviewerId) {
+  const { data, error } = await supabase
+    .from('active_masks')
+    .select(
+      `id, category, bbox, storage_path,
+       photo_id, photo_filename, photo_storage_path, created_at`,
+    )
+    .eq('project_id', projectId)
+    .eq('status', 'fail')
+    .eq('assigned_to', reviewerId)
+    .order('created_at', { ascending: true })
   if (error) throw error
-  return data.length
+  return data
 }
 
 // Remove a member from a project. Gated to owner-only in the UI (RLS also

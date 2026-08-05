@@ -1,7 +1,7 @@
 import { supabase } from './supabaseClient'
 import { uploadFile } from './storage'
 import { makeThumbnail } from './thumbnails'
-import { distributeRedoMasks } from './projects'
+import { rebalanceRedoAssignments } from './projects'
 
 // How many photos (and, separately, how many mask files within one photo)
 // are processed at once. Bounded rather than unbounded `Promise.all` so we
@@ -227,31 +227,15 @@ export async function commitMultiSplitPlan({ projectId, userId, bySplit }) {
     for (const key of Object.keys(total)) total[key] += summary[key]
   }
 
-  // New fail masks (just created above) auto-route to whoever's already
-  // assigned to that category, same as at member-add time — a fresh
-  // upload shouldn't require re-adding members to get their redo work
-  // routed to them.
-  await autoDistributeNewFailMasks(projectId)
+  // New fail masks (just created above) split evenly across current
+  // members — same "unassigned pool only, never steal existing work"
+  // rebalance used at member-add time, so a fresh upload's redo backlog
+  // doesn't require any manual step to get routed.
+  try {
+    await rebalanceRedoAssignments(projectId)
+  } catch (e) {
+    console.error('rebalanceRedoAssignments after upload failed:', e)
+  }
 
   return { perSplit, total }
-}
-
-async function autoDistributeNewFailMasks(projectId) {
-  const { data: members, error } = await supabase
-    .from('project_members')
-    .select('reviewer_id, assigned_categories')
-    .eq('project_id', projectId)
-  if (error) {
-    console.error('autoDistributeNewFailMasks: could not load members', error)
-    return
-  }
-  for (const m of members) {
-    if (m.assigned_categories?.length) {
-      try {
-        await distributeRedoMasks(projectId, m.reviewer_id, m.assigned_categories)
-      } catch (e) {
-        console.error('autoDistributeNewFailMasks failed for', m.reviewer_id, e)
-      }
-    }
-  }
 }
