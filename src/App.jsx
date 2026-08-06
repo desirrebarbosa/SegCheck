@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { supabase } from './lib/supabaseClient'
 import { useSession } from './auth/useSession'
 import { ToastProvider } from './components/Toast'
+import { Analytics } from '@vercel/analytics/react';
 import Login from './pages/Login'
 import ProjectsList from './pages/ProjectsList'
 import ProjectLayout from './components/ProjectLayout'
@@ -64,6 +65,10 @@ export default function App() {
             <Route path="members" element={<Members />} />
           </Route>
         </Routes>
+        <div>
+          {/* ... */}
+          <Analytics />
+        </div>
       </BrowserRouter>
     </ToastProvider>
   )
