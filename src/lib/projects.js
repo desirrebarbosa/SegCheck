@@ -101,7 +101,7 @@ export async function listMembers(projectId) {
 }
 
 // Add an existing SegCheck account to the project by email, then give them
-// their share of whatever redo backlog is currently unassigned.
+// their share of whatever review + redo backlog is currently unassigned.
 export async function addMemberByEmail(projectId, email) {
   const clean = email.trim().toLowerCase()
   const { data: rev, error: e1 } = await supabase
@@ -123,7 +123,7 @@ export async function addMemberByEmail(projectId, email) {
     throw e2
   }
 
-  const { perMember } = await rebalanceRedoAssignments(projectId)
+  const { perMember } = await rebalanceAllAssignments(projectId)
   return perMember[rev.id] ?? 0
 }
 
@@ -136,13 +136,21 @@ const UPDATE_CHUNK = 200
 // rows per request by default, so anything larger has to be paged.
 const PAGE = 1000
 
-// Splits every currently UNASSIGNED fail mask across all current project
-// members so that TOTAL load ends up as even as possible. Never touches a
-// mask that's already assigned to someone — this only distributes the
-// unclaimed pool, whether that's the first distribution after a member is
-// added or fresh fail masks from a new upload. Category is no longer a
-// factor in who gets what (was, in an earlier version of this feature —
-// replaced per direct instruction: split by count, not by class).
+// Splits every currently UNASSIGNED mask of one status across all current
+// project members so that TOTAL load for that status ends up as even as
+// possible. Never touches a mask that's already assigned to someone —
+// this only distributes the unclaimed pool, whether that's the first
+// distribution after a member is added or fresh masks from a new upload.
+// Category is no longer a factor in who gets what (was, in an earlier
+// version of this feature — replaced per direct instruction: split by
+// count, not by class).
+//
+// The two statuses that get distributed are the two kinds of work someone
+// can actually be given: 'pending' (QA review) and 'fail' (re-annotation).
+// They're balanced SEPARATELY — a fair share of the review queue and a
+// fair share of the redo backlog — rather than pooled, so nobody ends up
+// with all the reviewing and none of the redo just because the totals
+// happen to line up.
 //
 // Distribution is least-loaded-first rather than a positional round-robin:
 // each unassigned mask goes to whoever currently holds the fewest. On an
@@ -151,7 +159,7 @@ const PAGE = 1000
 // a plain round-robin hands a member who already has 100 items the same
 // share as one who has 0, so the gap never closes. Levelling here is the
 // only way the totals converge, given we can't reassign existing work.
-export async function rebalanceRedoAssignments(projectId) {
+export async function rebalanceAssignments(projectId, status) {
   const { data: members, error: mErr } = await supabase
     .from('project_members')
     .select('reviewer_id')
@@ -167,7 +175,7 @@ export async function rebalanceRedoAssignments(projectId) {
       .from('masks')
       .select('id')
       .eq('project_id', projectId)
-      .eq('status', 'fail')
+      .eq('status', status)
       .is('assigned_to', null)
       .range(from, from + PAGE - 1)
     if (error) throw error
@@ -192,7 +200,7 @@ export async function rebalanceRedoAssignments(projectId) {
         .from('masks')
         .select('id', { count: 'exact', head: true })
         .eq('project_id', projectId)
-        .eq('status', 'fail')
+        .eq('status', status)
         .eq('assigned_to', m.reviewer_id)
       if (error) throw error
       load.set(m.reviewer_id, count ?? 0)
@@ -219,6 +227,68 @@ export async function rebalanceRedoAssignments(projectId) {
   return { assigned: unassigned.length, perMember }
 }
 
+// The two distributable statuses, in the order they're handed out.
+// 'pending' first so a member who joins mid-project gets reviewing work
+// before redo work — reviewing is the step that unblocks everything else.
+export const ASSIGNABLE_STATUSES = ['pending', 'fail']
+
+// Distributes both kinds of work. Use this rather than calling
+// rebalanceAssignments directly, so no caller has to remember there are
+// two pools. Returns totals plus the per-status breakdown.
+export async function rebalanceAllAssignments(projectId) {
+  const byStatus = {}
+  let assigned = 0
+  const perMember = {}
+  for (const status of ASSIGNABLE_STATUSES) {
+    const result = await rebalanceAssignments(projectId, status)
+    byStatus[status] = result
+    assigned += result.assigned
+    for (const [reviewerId, n] of Object.entries(result.perMember)) {
+      perMember[reviewerId] = (perMember[reviewerId] ?? 0) + n
+    }
+  }
+  return { assigned, perMember, byStatus }
+}
+
+// One reviewer's own numbers, for the review queue header.
+//
+// `pending` is what's still assigned to them — work outstanding. `pass`
+// and `fail` are counted by `reviewed_by` instead, because a decision
+// clears `assigned_to` (the mask leaves your stack the moment you decide
+// on it, and a fail goes back into the pool to be redistributed for
+// redo). So these read as "waiting on me / I passed / I failed", which is
+// what someone actually wants to know about their own progress.
+export async function fetchMyQueueCounts(projectId, reviewerId) {
+  const countWhere = async (build) => {
+    const { count, error } = await build(
+      supabase.from('active_masks').select('id', { count: 'exact', head: true }),
+    ).eq('project_id', projectId)
+    if (error) throw error
+    return count ?? 0
+  }
+
+  const [pending, pass, fail] = await Promise.all([
+    countWhere((q) => q.eq('status', 'pending').eq('assigned_to', reviewerId)),
+    countWhere((q) => q.eq('status', 'pass').eq('reviewed_by', reviewerId)),
+    countWhere((q) => q.eq('status', 'fail').eq('reviewed_by', reviewerId)),
+  ])
+  return { pending, pass, fail }
+}
+
+// How much unclaimed-by-me pending work is left across the project — the
+// pool the "help others" mode draws from. Used to decide whether offering
+// to help is worth showing at all.
+export async function fetchHelpablePendingCount(projectId, reviewerId) {
+  const { count, error } = await supabase
+    .from('active_masks')
+    .select('id', { count: 'exact', head: true })
+    .eq('project_id', projectId)
+    .eq('status', 'pending')
+    .or(`assigned_to.neq.${reviewerId},assigned_to.is.null`)
+  if (error) throw error
+  return count ?? 0
+}
+
 // Read-only: the redo (fail) masks currently assigned to one reviewer, for
 // the dedicated "My Redo" list.
 export async function fetchMyRedoAssignments(projectId, reviewerId) {
@@ -241,10 +311,10 @@ export async function fetchMyRedoAssignments(projectId, reviewerId) {
 // policies — owner is additionally enforced client-side per your call that
 // membership changes should be owner-only, not just lead-only).
 export async function removeMember(projectId, reviewerId) {
-  // Release their redo work BEFORE dropping the membership row. Anything
-  // still pointing at a removed member is stranded: it isn't null, so
-  // rebalanceRedoAssignments skips it, and no current member's My Redo
-  // list can surface it — the items would quietly disappear from the
+  // Release their work BEFORE dropping the membership row. Anything still
+  // pointing at a removed member is stranded: it isn't null, so
+  // rebalanceAssignments skips it, and no current member's queue or My
+  // Redo list can surface it — the items would quietly disappear from the
   // backlog. Doing this first means a failure here aborts the removal
   // with the assignments intact, rather than the other order, which
   // could drop the membership and then strand the work.
@@ -252,7 +322,7 @@ export async function removeMember(projectId, reviewerId) {
     .from('masks')
     .update({ assigned_to: null })
     .eq('project_id', projectId)
-    .eq('status', 'fail')
+    .in('status', ASSIGNABLE_STATUSES)
     .eq('assigned_to', reviewerId)
   if (relErr) throw relErr
 
@@ -264,7 +334,7 @@ export async function removeMember(projectId, reviewerId) {
   if (error) throw error
 
   // Hand the released items to whoever's left.
-  return rebalanceRedoAssignments(projectId)
+  return rebalanceAllAssignments(projectId)
 }
 // Pending/pass/fail counts for one project — cheap count-only queries, used
 // to render the projects list without pulling every mask row for every

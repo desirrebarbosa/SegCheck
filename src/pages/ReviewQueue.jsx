@@ -3,6 +3,11 @@ import { useOutletContext } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import MaskOverlay from '../components/MaskOverlay'
 import { getClassColors, setClassColor, defaultColorFor } from '../lib/classColors'
+import {
+  fetchMyQueueCounts,
+  fetchHelpablePendingCount,
+  rebalanceAssignments,
+} from '../lib/projects'
 import { useToast } from '../components/Toast'
 
 // How many pending masks to hold in the local queue at once, and how close
@@ -17,6 +22,11 @@ const MASK_COLUMNS = `id, manifest_mask_id, storage_path, category, bbox, segmen
 export default function ReviewQueue() {
   const { projectId } = useOutletContext()
   const { showError, showSuccess } = useToast()
+  const [userId, setUserId] = useState(null)
+  // 'mine' = only what's assigned to me. 'helping' = everyone else's
+  // still-pending work, entered deliberately once my own stack is clear.
+  const [mode, setMode] = useState('mine')
+  const [helpable, setHelpable] = useState(0)
   const [queue, setQueue] = useState([])
   const [queueIndex, setQueueIndex] = useState(0)
   const [queueLoading, setQueueLoading] = useState(true)
@@ -33,13 +43,32 @@ export default function ReviewQueue() {
   // undefined = still loading the first batch, null = queue genuinely empty
   const mask = queue.length > 0 ? queue[queueIndex] : queueLoading ? undefined : null
 
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => setUserId(data.user?.id ?? null))
+  }, [])
+
+  // The one place the "whose work is this" rule lives, so the initial load
+  // and the top-up below can't drift apart. In helping mode we deliberately
+  // include unassigned masks as well as other people's: anything that
+  // slipped through distribution would otherwise be reviewable by nobody.
+  const scopeToMode = useCallback(
+    (query) =>
+      mode === 'mine'
+        ? query.eq('assigned_to', userId)
+        : query.or(`assigned_to.neq.${userId},assigned_to.is.null`),
+    [mode, userId],
+  )
+
   const loadQueue = useCallback(async () => {
+    if (!userId) return // wait for the session before scoping anything
     setQueueLoading(true)
-    const { data, error } = await supabase
-      .from('active_masks')
-      .select(MASK_COLUMNS)
-      .eq('project_id', projectId)
-      .eq('status', 'pending')
+    const { data, error } = await scopeToMode(
+      supabase
+        .from('active_masks')
+        .select(MASK_COLUMNS)
+        .eq('project_id', projectId)
+        .eq('status', 'pending'),
+    )
       .order('created_at', { ascending: true })
       .limit(QUEUE_BATCH_SIZE)
     setQueueLoading(false)
@@ -50,15 +79,18 @@ export default function ReviewQueue() {
     }
     setQueue(data ?? [])
     setQueueIndex(0)
-  }, [projectId, showError])
+  }, [projectId, showError, userId, scopeToMode])
 
   const fetchMore = useCallback(
     async (afterCreatedAt) => {
-      const { data, error } = await supabase
-        .from('active_masks')
-        .select(MASK_COLUMNS)
-        .eq('project_id', projectId)
-        .eq('status', 'pending')
+      if (!userId) return []
+      const { data, error } = await scopeToMode(
+        supabase
+          .from('active_masks')
+          .select(MASK_COLUMNS)
+          .eq('project_id', projectId)
+          .eq('status', 'pending'),
+      )
         .gt('created_at', afterCreatedAt)
         .order('created_at', { ascending: true })
         .limit(QUEUE_BATCH_SIZE)
@@ -68,7 +100,7 @@ export default function ReviewQueue() {
       }
       return data ?? []
     },
-    [projectId],
+    [projectId, userId, scopeToMode],
   )
 
   // Quietly top up the queue once we're getting close to the end of what's
@@ -92,30 +124,22 @@ export default function ReviewQueue() {
   }, [queueIndex, queue, fetchMore])
 
   const loadCounts = useCallback(async () => {
-    // 1. Fetch exact counts without downloading the rows
-    const fetchCount = async (status) => {
-      const { count, error } = await supabase
-        .from('active_masks')
-        .select('*', { count: 'exact', head: true })
-        .eq('project_id', projectId)
-        .eq('status', status)
-      
-      if (error) console.error(`Failed to count ${status}:`, error)
-      return count || 0
+    if (!userId) return
+    // My own numbers, not the project's — exact counts, no rows fetched.
+    try {
+      const [mine, helpableCount] = await Promise.all([
+        fetchMyQueueCounts(projectId, userId),
+        fetchHelpablePendingCount(projectId, userId),
+      ])
+      setCounts(mine)
+      setHelpable(helpableCount)
+    } catch (e) {
+      console.error('loadCounts failed:', e)
     }
 
-    const [pending, pass, fail] = await Promise.all([
-      fetchCount('pending'),
-      fetchCount('pass'),
-      fetchCount('fail')
-    ])
-
-    setCounts({ pending, pass, fail })
-
-    // 2. Handle categories separately
-    // Since we aren't downloading rows, we must fetch categories directly.
-    // Note: If you don't have a separate categories table, we fetch the 
-    // category column and manually deduplicate. 
+    // Categories stay project-wide: they drive the class-color picker,
+    // which is per-project config rather than anyone's personal workload.
+    // No categories table, so fetch the column and dedupe client-side.
     const { data: catData, error: catError } = await supabase
       .from('active_masks')
       .select('category')
@@ -128,7 +152,7 @@ export default function ReviewQueue() {
       }
       setCategories([...cats].sort())
     }
-  }, [projectId])
+  }, [projectId, userId])
 
   useEffect(() => {
     loadQueue()
@@ -179,9 +203,22 @@ export default function ReviewQueue() {
       const {
         data: { user },
       } = await supabase.auth.getUser()
+      // assigned_to is cleared on the way out: the mask has left this
+      // reviewer's stack either way. For a pass that's the end of it; for
+      // a fail it drops the mask back into the unassigned redo pool so the
+      // rebalance below can hand it to whoever has the least redo work —
+      // which is deliberately NOT guaranteed to be the person who just
+      // failed it. Leaving assigned_to set would make the reviewer the
+      // permanent owner of every mask they rejected and bypass redo
+      // distribution entirely.
       const { error: updErr } = await supabase
         .from('masks')
-        .update({ status, reviewed_by: user.id, reviewed_at: new Date().toISOString() })
+        .update({
+          status,
+          reviewed_by: user.id,
+          reviewed_at: new Date().toISOString(),
+          assigned_to: null,
+        })
         .eq('id', mask.id)
       if (updErr) throw updErr
       await supabase.from('review_logs').insert({
@@ -200,6 +237,20 @@ export default function ReviewQueue() {
       const nextQueue = [...queue.slice(0, decidedIndex), ...queue.slice(decidedIndex + 1)]
       setQueue(nextQueue)
       setQueueIndex(Math.min(decidedIndex, Math.max(0, nextQueue.length - 1)))
+
+      // Route the mask we just failed to someone for re-annotation. Only
+      // the fail path needs this, and only the one now-unassigned row is
+      // in play, so it's a cheap call. Non-fatal: the decision itself is
+      // already saved, and the next rebalance would pick the mask up
+      // anyway — it just wouldn't appear in anyone's My Redo until then.
+      if (status === 'fail') {
+        try {
+          await rebalanceAssignments(projectId, 'fail')
+        } catch (e) {
+          console.error('rebalanceAssignments after fail failed:', e)
+        }
+      }
+
       await loadCounts()
     } catch (e) {
       console.error('decide failed:', e)
@@ -229,7 +280,14 @@ export default function ReviewQueue() {
     <div className="flex flex-col gap-4 lg:flex-row">
       <section className="min-w-0 flex-1">
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-medium">Review</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-lg font-medium">Review</h2>
+            {mode === 'helping' && (
+              <span className="rounded-lg bg-[#E6F1FB] px-2 py-0.5 text-xs text-[#0C447C]">
+                helping others
+              </span>
+            )}
+          </div>
           {counts && (
             <div className="flex gap-3 text-xs">
               <span className="text-[#888780]">{counts.pending} pending</span>
@@ -238,13 +296,53 @@ export default function ReviewQueue() {
             </div>
           )}
         </div>
+        <p className="mt-0.5 text-xs text-[#888780]">
+          {mode === 'mine'
+            ? 'Your assigned share of the review queue.'
+            : "Other members' remaining work — your own queue is clear."}
+        </p>
 
         {mask === undefined && <p className="mt-6 text-sm text-[#888780]">Loading…</p>}
-        {mask === null && (
-          <p className="mt-6 text-sm text-[#888780]">
-            Nothing pending — queue is clear. Upload more, or check the Dashboard for the redo
-            batch.
-          </p>
+
+        {mask === null && mode === 'mine' && (
+          <div className="mt-6 space-y-3">
+            <p className="text-sm text-[#888780]">
+              Your queue is clear — everything assigned to you has been reviewed.
+            </p>
+            {helpable > 0 ? (
+              <>
+                <p className="text-sm text-[#5F5E5A]">
+                  {helpable} mask(s) still pending across the rest of the team.
+                </p>
+                <button
+                  onClick={() => setMode('helping')}
+                  className="flex items-center gap-1.5 rounded-lg bg-[#1a1a1a] px-4 py-2 text-sm font-medium text-white"
+                >
+                  <i className="ti ti-users text-base" aria-hidden="true"></i>
+                  Help other members
+                </button>
+              </>
+            ) : (
+              <p className="text-sm text-[#888780]">
+                Nothing pending anywhere on this project. Upload more, or check the Dashboard for
+                the redo batch.
+              </p>
+            )}
+          </div>
+        )}
+
+        {mask === null && mode === 'helping' && (
+          <div className="mt-6 space-y-3">
+            <p className="text-sm text-[#888780]">
+              Nothing left to help with — the whole project's queue is clear.
+            </p>
+            <button
+              onClick={() => setMode('mine')}
+              className="rounded-lg border border-[#B4B2A9] px-4 py-2 text-sm hover:bg-[#F7F7F5]"
+            >
+              Back to my queue
+            </button>
+          </div>
         )}
 
         {mask && (
@@ -287,7 +385,7 @@ export default function ReviewQueue() {
                   <i className="ti ti-chevron-left text-base" aria-hidden="true"></i>
                 </button>
                 <span className="min-w-[3.5rem] px-1 text-center text-xs tabular-nums text-[#888780]">
-                  {queueIndex + 1} of {counts?.pending ?? queue.length}
+                  {queueIndex + 1} of {(mode === 'mine' ? counts?.pending : helpable) ?? queue.length}
                 </span>
                 <button
                   disabled={!canGoNext}
@@ -301,6 +399,17 @@ export default function ReviewQueue() {
               </div>
               <span className="text-xs text-[#888780]">Not sure? Skip and come back to it</span>
             </div>
+
+            {mode === 'helping' && (
+              <p className="text-center">
+                <button
+                  onClick={() => setMode('mine')}
+                  className="text-xs text-[#888780] underline hover:text-[#1a1a1a]"
+                >
+                  Back to my queue
+                </button>
+              </p>
+            )}
 
             <div className="flex gap-2">
               <button

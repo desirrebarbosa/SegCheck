@@ -1,7 +1,7 @@
 import { supabase } from './supabaseClient'
 import { uploadFile } from './storage'
 import { makeThumbnail } from './thumbnails'
-import { rebalanceRedoAssignments } from './projects'
+import { rebalanceAllAssignments } from './projects'
 
 // How many photos (and, separately, how many mask files within one photo)
 // are processed at once. Bounded rather than unbounded `Promise.all` so we
@@ -232,9 +232,9 @@ export async function commitMultiSplitPlan({ projectId, userId, bySplit }) {
   // rebalance used at member-add time, so a fresh upload's redo backlog
   // doesn't require any manual step to get routed.
   try {
-    await rebalanceRedoAssignments(projectId)
+    await rebalanceAllAssignments(projectId)
   } catch (e) {
-    console.error('rebalanceRedoAssignments after upload failed:', e)
+    console.error('rebalanceAllAssignments after upload failed:', e)
   }
 
   return { perSplit, total }
