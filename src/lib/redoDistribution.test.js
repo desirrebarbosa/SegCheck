@@ -5,7 +5,7 @@ import { distributeEvenly } from './redoDistribution'
 // out so that TOTAL per-member load ends up as level as possible, without
 // ever reassigning work someone already holds.
 
-// Convenience: build the load Map the way rebalanceRedoAssignments does.
+// Convenience: build the load Map the way rebalanceAllAssignments does.
 const load = (obj) => new Map(Object.entries(obj))
 
 // How many each reviewer ends up with, given what they started with.

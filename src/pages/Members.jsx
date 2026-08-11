@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
-import { listMembers, addMemberByEmail, removeMember } from '../lib/projects'
+import {
+  listMembers,
+  addMemberByEmail,
+  removeMember,
+  rebalanceAllAssignments,
+} from '../lib/projects'
 import { useToast } from '../components/Toast'
 
 export default function Members() {
@@ -41,6 +46,28 @@ export default function Members() {
     }
   }
 
+  // Distribution normally happens on its own (upload, member added or
+  // removed). This is the manual trigger for the case those don't cover:
+  // work that predates auto-distribution, or anything left unassigned by
+  // a rebalance that failed midway. Safe to press at any time — it only
+  // ever hands out unclaimed work, never moves what someone already has.
+  async function handleDistribute() {
+    setBusy(true)
+    try {
+      const { assigned } = await rebalanceAllAssignments(projectId)
+      await refresh()
+      showSuccess(
+        assigned > 0
+          ? `${assigned} unassigned mask(s) distributed.`
+          : 'Nothing to distribute — all work is already assigned.',
+      )
+    } catch (e) {
+      showError('Could not distribute work — ' + e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function handleRemove(reviewerId, label) {
     if (reviewerId === project?.owner_id) {
       showError('The project owner can\u2019t be removed from the project.')
@@ -64,8 +91,8 @@ export default function Members() {
     <section className="max-w-xl">
       <h2 className="text-lg font-medium">Members</h2>
       <p className="mt-1 text-sm text-[#888780]">
-        Redo (failed) items split evenly by count across everyone here — no manual
-        assignment needed.
+        Review and redo work is split evenly by count across everyone here — no manual
+        assignment needed. Each member sees only their own share.
       </p>
 
       <form onSubmit={handleAdd} className="mt-4 flex gap-2">
@@ -84,6 +111,17 @@ export default function Members() {
           {busy ? 'Adding…' : 'Add'}
         </button>
       </form>
+
+      {isOwner && (
+        <button
+          onClick={handleDistribute}
+          disabled={busy}
+          className="mt-3 flex items-center gap-1.5 rounded-lg border border-[#B4B2A9] px-3.5 py-2 text-sm hover:bg-[#F7F7F5] disabled:opacity-50"
+        >
+          <i className="ti ti-arrows-split-2 text-base" aria-hidden="true"></i>
+          Distribute unassigned work
+        </button>
+      )}
 
       <div className="mt-5 divide-y divide-[#E5E4DF] rounded-xl border border-[#E5E4DF]">
         {members === null && <p className="p-4 text-sm text-[#888780]">Loading…</p>}
