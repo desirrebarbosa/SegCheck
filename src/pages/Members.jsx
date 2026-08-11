@@ -48,9 +48,13 @@ export default function Members() {
     }
     if (!confirm(`Remove ${label} from this project?`)) return
     try {
-      await removeMember(projectId, reviewerId)
+      const { assigned } = await removeMember(projectId, reviewerId)
       await refresh()
-      showSuccess('Member removed.')
+      showSuccess(
+        assigned > 0
+          ? `Member removed — ${assigned} redo item(s) redistributed.`
+          : 'Member removed.',
+      )
     } catch (e) {
       showError('Could not remove member — ' + e.message)
     }

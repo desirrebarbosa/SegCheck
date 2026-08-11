@@ -1,4 +1,5 @@
 import { supabase } from './supabaseClient'
+import { distributeEvenly } from './redoDistribution'
 
 // All queries below are further constrained by RLS, so they only ever return
 // projects/members the signed-in reviewer is allowed to see.
@@ -126,14 +127,30 @@ export async function addMemberByEmail(projectId, email) {
   return perMember[rev.id] ?? 0
 }
 
-// Evenly splits every currently UNASSIGNED fail mask across all current
-// project members, round-robin, so the backlog divides as equally as
-// possible (e.g. 190 unassigned / 4 members -> ~47-48 each). Never touches
-// a mask that's already assigned to someone — this only distributes the
+// How many mask ids go into one `.in('id', [...])` update. Every id is a
+// 36-char UUID that ends up in the request URL, so an unbounded list on a
+// few thousand masks builds a URL long enough to get rejected.
+const UPDATE_CHUNK = 200
+
+// Rows per page when reading the backlog. PostgREST returns at most 1000
+// rows per request by default, so anything larger has to be paged.
+const PAGE = 1000
+
+// Splits every currently UNASSIGNED fail mask across all current project
+// members so that TOTAL load ends up as even as possible. Never touches a
+// mask that's already assigned to someone — this only distributes the
 // unclaimed pool, whether that's the first distribution after a member is
 // added or fresh fail masks from a new upload. Category is no longer a
 // factor in who gets what (was, in an earlier version of this feature —
 // replaced per direct instruction: split by count, not by class).
+//
+// Distribution is least-loaded-first rather than a positional round-robin:
+// each unassigned mask goes to whoever currently holds the fewest. On an
+// empty backlog the two are identical (190 unassigned / 4 members ->
+// 48/48/47/47 either way), but they diverge as soon as load is uneven —
+// a plain round-robin hands a member who already has 100 items the same
+// share as one who has 0, so the gap never closes. Levelling here is the
+// only way the totals converge, given we can't reassign existing work.
 export async function rebalanceRedoAssignments(projectId) {
   const { data: members, error: mErr } = await supabase
     .from('project_members')
@@ -142,26 +159,60 @@ export async function rebalanceRedoAssignments(projectId) {
   if (mErr) throw mErr
   if (members.length === 0) return { assigned: 0, perMember: {} }
 
-  const { data: unassigned, error: uErr } = await supabase
-    .from('masks')
-    .select('id')
-    .eq('project_id', projectId)
-    .eq('status', 'fail')
-    .is('assigned_to', null)
-  if (uErr) throw uErr
+  // Paged: PostgREST caps a plain select at 1000 rows, which would
+  // silently leave the rest of a large backlog undistributed.
+  const unassigned = []
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from('masks')
+      .select('id')
+      .eq('project_id', projectId)
+      .eq('status', 'fail')
+      .is('assigned_to', null)
+      .range(from, from + PAGE - 1)
+    if (error) throw error
+    unassigned.push(...data)
+    if (data.length < PAGE) break
+  }
   if (unassigned.length === 0) return { assigned: 0, perMember: {} }
 
-  const byReviewer = new Map()
-  unassigned.forEach((mask, i) => {
-    const reviewerId = members[i % members.length].reviewer_id
-    if (!byReviewer.has(reviewerId)) byReviewer.set(reviewerId, [])
-    byReviewer.get(reviewerId).push(mask.id)
-  })
+  // Current per-member load, so the split below levels totals instead of
+  // just splitting the new pool evenly. Counted server-side per member
+  // (head:true, no rows returned) rather than by tallying every assigned
+  // row client-side — exact regardless of backlog size, and it naturally
+  // ignores rows pointing at someone who's no longer a member.
+  // Seeded in member order first: Map iteration order is insertion order,
+  // and these counts resolve in whatever order the network returns them.
+  // distributeEvenly breaks ties by iteration order, so seeding keeps the
+  // split deterministic instead of varying run to run.
+  const load = new Map(members.map((m) => [m.reviewer_id, 0]))
+  await Promise.all(
+    members.map(async (m) => {
+      const { count, error } = await supabase
+        .from('masks')
+        .select('id', { count: 'exact', head: true })
+        .eq('project_id', projectId)
+        .eq('status', 'fail')
+        .eq('assigned_to', m.reviewer_id)
+      if (error) throw error
+      load.set(m.reviewer_id, count ?? 0)
+    }),
+  )
+
+  const byReviewer = distributeEvenly(
+    unassigned.map((m) => m.id),
+    load,
+  )
 
   const perMember = {}
   for (const [reviewerId, ids] of byReviewer) {
-    const { error } = await supabase.from('masks').update({ assigned_to: reviewerId }).in('id', ids)
-    if (error) throw error
+    for (let i = 0; i < ids.length; i += UPDATE_CHUNK) {
+      const { error } = await supabase
+        .from('masks')
+        .update({ assigned_to: reviewerId })
+        .in('id', ids.slice(i, i + UPDATE_CHUNK))
+      if (error) throw error
+    }
     perMember[reviewerId] = ids.length
   }
 
@@ -190,12 +241,30 @@ export async function fetchMyRedoAssignments(projectId, reviewerId) {
 // policies — owner is additionally enforced client-side per your call that
 // membership changes should be owner-only, not just lead-only).
 export async function removeMember(projectId, reviewerId) {
+  // Release their redo work BEFORE dropping the membership row. Anything
+  // still pointing at a removed member is stranded: it isn't null, so
+  // rebalanceRedoAssignments skips it, and no current member's My Redo
+  // list can surface it — the items would quietly disappear from the
+  // backlog. Doing this first means a failure here aborts the removal
+  // with the assignments intact, rather than the other order, which
+  // could drop the membership and then strand the work.
+  const { error: relErr } = await supabase
+    .from('masks')
+    .update({ assigned_to: null })
+    .eq('project_id', projectId)
+    .eq('status', 'fail')
+    .eq('assigned_to', reviewerId)
+  if (relErr) throw relErr
+
   const { error } = await supabase
     .from('project_members')
     .delete()
     .eq('project_id', projectId)
     .eq('reviewer_id', reviewerId)
   if (error) throw error
+
+  // Hand the released items to whoever's left.
+  return rebalanceRedoAssignments(projectId)
 }
 // Pending/pass/fail counts for one project — cheap count-only queries, used
 // to render the projects list without pulling every mask row for every
@@ -242,9 +311,14 @@ export async function fetchWeeklyActivity(projectId) {
   return counts
 }
 
-// Distinct categories seen in a project's masks — used to populate the
-// category picker on Members (add-member form) without a separate
+// Distinct categories seen in a project's masks, without a separate
 // categories table. Cheap: selects one column, dedupes client-side.
+//
+// Currently UNUSED: this backed the per-category picker on the add-member
+// form, from the version of redo assignment that split work by class.
+// That's been replaced by the even-by-count split, so nothing calls this
+// today. Kept because Feature 6's per-category guide defaults (skeleton vs
+// star-convex) need exactly this list — delete it if that lands elsewhere.
 export async function fetchProjectCategories(projectId) {
   const { data, error } = await supabase
     .from('masks')
