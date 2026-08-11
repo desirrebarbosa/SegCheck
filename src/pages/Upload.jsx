@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabaseClient'
 import { readZipEntries } from '../lib/zipHelpers'
 import { buildSingleSplitUploadPlan } from '../lib/manifest'
 import { commitSplitPlan } from '../lib/uploads'
+import { rebalanceRedoAssignments } from '../lib/projects'
 import { useToast } from '../components/Toast'
 
 export default function Upload() {
@@ -51,7 +52,20 @@ export default function Upload() {
         userId: user.id,
         plan: planResult.plan,
       })
-      setResult({ split: planResult.split, ...summary })
+      // Any masks this upload auto-failed are new, unassigned redo work —
+      // split them evenly across the current members so the backlog routes
+      // without a manual step. Same "unassigned pool only" rebalance
+      // commitMultiSplitPlan runs, and non-fatal for the same reason: the
+      // upload itself already succeeded, so a failure here shouldn't
+      // surface as a failed upload. Next upload (or member add) retries it.
+      let assigned = 0
+      try {
+        ;({ assigned } = await rebalanceRedoAssignments(projectId))
+      } catch (e) {
+        console.error('rebalanceRedoAssignments after upload failed:', e)
+      }
+
+      setResult({ split: planResult.split, ...summary, assigned })
       setPlanResult(null)
       setSplit('')
       setOriginalZip(null)
@@ -167,6 +181,9 @@ export default function Upload() {
             {result.masksCreated} masks created, {result.autoFailed} auto-failed, for split "
             {result.split}".
           </p>
+          {result.assigned > 0 && (
+            <p>{result.assigned} redo mask(s) distributed across the project's members.</p>
+          )}
         </div>
       )}
     </section>

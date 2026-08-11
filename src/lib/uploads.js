@@ -1,6 +1,7 @@
 import { supabase } from './supabaseClient'
 import { uploadFile } from './storage'
 import { makeThumbnail } from './thumbnails'
+import { rebalanceRedoAssignments } from './projects'
 
 // How many photos (and, separately, how many mask files within one photo)
 // are processed at once. Bounded rather than unbounded `Promise.all` so we
@@ -224,6 +225,16 @@ export async function commitMultiSplitPlan({ projectId, userId, bySplit }) {
     const summary = await commitSplitPlan({ projectId, split, userId, plan })
     perSplit[split] = summary
     for (const key of Object.keys(total)) total[key] += summary[key]
+  }
+
+  // New fail masks (just created above) split evenly across current
+  // members — same "unassigned pool only, never steal existing work"
+  // rebalance used at member-add time, so a fresh upload's redo backlog
+  // doesn't require any manual step to get routed.
+  try {
+    await rebalanceRedoAssignments(projectId)
+  } catch (e) {
+    console.error('rebalanceRedoAssignments after upload failed:', e)
   }
 
   return { perSplit, total }

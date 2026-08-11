@@ -11,6 +11,7 @@ import ReviewQueue from './pages/ReviewQueue'
 import Upload from './pages/Upload'
 import Dashboard from './pages/Dashboard'
 import Members from './pages/Members'
+import MyRedo from './pages/MyRedo'
 
 // Make sure a row exists in `reviewers` for the logged-in user, and keep the
 // email current (the email is how leads add this person to a project).
@@ -58,6 +59,7 @@ export default function App() {
           {/* Everything inside a project is scoped by :projectId */}
           <Route path="/projects/:projectId" element={<ProjectLayout session={session} />}>
             <Route index element={<ReviewQueue />} />
+            <Route path="my-redo" element={<MyRedo />} />
             <Route path="upload" element={<Upload />} />
             <Route path="dashboard" element={<Dashboard />} />
             <Route path="members" element={<Members />} />

@@ -14,7 +14,7 @@ export default function Members() {
     try {
       setMembers(await listMembers(projectId))
     } catch (e) {
-      console.error('listMembers failed:', e)
+      console.error('Members refresh failed:', e)
       showError('Could not load members.')
     }
   }, [projectId, showError])
@@ -28,10 +28,12 @@ export default function Members() {
     if (!email.trim()) return
     setBusy(true)
     try {
-      await addMemberByEmail(projectId, email)
+      const assignedCount = await addMemberByEmail(projectId, email)
       setEmail('')
       await refresh()
-      showSuccess('Member added.')
+      showSuccess(
+        assignedCount > 0 ? `Added — ${assignedCount} redo item(s) assigned.` : 'Member added.',
+      )
     } catch (e) {
       showError(e.message)
     } finally {
@@ -46,9 +48,13 @@ export default function Members() {
     }
     if (!confirm(`Remove ${label} from this project?`)) return
     try {
-      await removeMember(projectId, reviewerId)
+      const { assigned } = await removeMember(projectId, reviewerId)
       await refresh()
-      showSuccess('Member removed.')
+      showSuccess(
+        assigned > 0
+          ? `Member removed — ${assigned} redo item(s) redistributed.`
+          : 'Member removed.',
+      )
     } catch (e) {
       showError('Could not remove member — ' + e.message)
     }
@@ -57,6 +63,10 @@ export default function Members() {
   return (
     <section className="max-w-xl">
       <h2 className="text-lg font-medium">Members</h2>
+      <p className="mt-1 text-sm text-[#888780]">
+        Redo (failed) items split evenly by count across everyone here — no manual
+        assignment needed.
+      </p>
 
       <form onSubmit={handleAdd} className="mt-4 flex gap-2">
         <input
@@ -78,12 +88,15 @@ export default function Members() {
       <div className="mt-5 divide-y divide-[#E5E4DF] rounded-xl border border-[#E5E4DF]">
         {members === null && <p className="p-4 text-sm text-[#888780]">Loading…</p>}
         {members?.map((m) => (
-          <div key={m.reviewer.id} className="flex items-center justify-between px-4 py-2.5">
-            <div>
-              <p className="text-sm">{m.reviewer.display_name || m.reviewer.email}</p>
-              <p className="text-xs text-[#888780]">{m.reviewer.email}</p>
+          <div key={m.reviewer.id} className="flex items-center justify-between gap-3 px-4 py-2.5">
+            <div className="min-w-0">
+              <p className="truncate text-sm">{m.reviewer.display_name || m.reviewer.email}</p>
+              <p className="truncate text-xs text-[#888780]">{m.reviewer.email}</p>
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-shrink-0 items-center gap-3">
+              {m.redo_count > 0 && (
+                <span className="text-xs text-[#791F1F]">{m.redo_count} redo</span>
+              )}
               {m.is_lead && (
                 <span className="rounded-lg bg-[#E6F1FB] px-2 py-0.5 text-xs text-[#0C447C]">
                   lead
