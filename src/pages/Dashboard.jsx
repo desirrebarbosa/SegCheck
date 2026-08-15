@@ -81,6 +81,7 @@ export default function Dashboard() {
   const [members, setMembers] = useState([]) // [{ reviewer: {id, email, display_name}, redo_count }]
   const [assigneeId, setAssigneeId] = useState('') // '' = everyone
   const [redoProgress, setRedoProgress] = useState(null) // { phase, done, total }
+  const [redoController, setRedoController] = useState(null) // AbortController for the in-flight download
 
   const loadCounts = useCallback(async () => {
     try {
@@ -128,6 +129,8 @@ export default function Dashboard() {
   const redoCountInScope = selectedMember ? selectedMember.redo_count : (counts?.fail ?? 0)
 
   async function exportRedoZip() {
+    const controller = new AbortController()
+    setRedoController(controller)
     setBusy(true)
     setRedoProgress(null)
     try {
@@ -141,14 +144,25 @@ export default function Dashboard() {
       const filenamePrefix = selectedMember
         ? (selectedMember.reviewer.display_name || selectedMember.reviewer.email)
         : (project?.name ?? 'segcheck')
-      await exportRedoBatch({ rows, filenamePrefix, membersById, onProgress: setRedoProgress })
+      await exportRedoBatch({
+        rows,
+        filenamePrefix,
+        membersById,
+        onProgress: setRedoProgress,
+        signal: controller.signal,
+      })
       showSuccess('Redo batch downloaded.')
     } catch (e) {
-      console.error('exportRedoZip failed:', e)
-      showError('Could not build the redo batch.')
+      if (controller.signal.aborted) {
+        showSuccess('Redo batch download cancelled.')
+      } else {
+        console.error('exportRedoZip failed:', e)
+        showError('Could not build the redo batch.')
+      }
     } finally {
       setBusy(false)
       setRedoProgress(null)
+      setRedoController(null)
     }
   }
 
@@ -201,6 +215,7 @@ export default function Dashboard() {
         <ProgressBar
           percent={exportOverallPercent(redoProgress)}
           label={`${exportPhaseLabel(redoProgress)}…`}
+          onCancel={() => redoController?.abort()}
         />
       )}
 
@@ -247,6 +262,7 @@ function AnnotatedExport({ projectId, projectName }) {
   const [splitCounts, setSplitCounts] = useState(null) // Map<split, count>
   const [downloadingSplit, setDownloadingSplit] = useState(null)
   const [progress, setProgress] = useState(null) // { percent, label }
+  const [controller, setController] = useState(null) // AbortController for the in-flight download
 
   const load = useCallback(async () => {
     try {
@@ -262,6 +278,8 @@ function AnnotatedExport({ projectId, projectName }) {
   }, [load])
 
   async function handleDownload(split) {
+    const abortController = new AbortController()
+    setController(abortController)
     setDownloadingSplit(split)
     setProgress(null)
     try {
@@ -269,23 +287,38 @@ function AnnotatedExport({ projectId, projectName }) {
       // Two phases, weighted: fetching every photo/mask from Storage is
       // the slow part for any real batch, compressing what's already
       // in memory is comparatively quick.
-      const { files } = await collectPhotoMaskEntries(rows, {}, (done, total) => {
-        setProgress({
-          percent: (done / total) * 70,
-          label: `Downloading photos & masks (${done}/${total})\u2026`,
-        })
-      })
+      const { files } = await collectPhotoMaskEntries(
+        rows,
+        {},
+        (done, total) => {
+          setProgress({
+            percent: (done / total) * 70,
+            label: `Downloading photos & masks (${done}/${total})\u2026`,
+          })
+        },
+        abortController.signal,
+      )
       const label = split === '(no split)' ? 'default' : split
-      await downloadZip(`${projectName ?? 'segcheck'}-${label}-annotated.zip`, files, (percent) => {
-        setProgress({ percent: 70 + percent * 0.3, label: 'Compressing zip\u2026' })
-      })
+      await downloadZip(
+        `${projectName ?? 'segcheck'}-${label}-annotated.zip`,
+        files,
+        (percent) => {
+          setProgress({ percent: 70 + percent * 0.3, label: 'Compressing zip\u2026' })
+        },
+        abortController.signal,
+      )
       showSuccess(`Downloaded ${label}.`)
     } catch (e) {
-      console.error('AnnotatedExport download failed:', e)
-      showError('Could not build that split\u2019s zip.')
+      if (abortController.signal.aborted) {
+        showSuccess('Download cancelled.')
+      } else {
+        console.error('AnnotatedExport download failed:', e)
+        showError('Could not build that split\u2019s zip.')
+      }
     } finally {
       setDownloadingSplit(null)
       setProgress(null)
+      setController(null)
     }
   }
 
@@ -314,7 +347,13 @@ function AnnotatedExport({ projectId, projectName }) {
             </button>
           ))}
       </div>
-      {progress && <ProgressBar percent={progress.percent} label={progress.label} />}
+      {progress && (
+        <ProgressBar
+          percent={progress.percent}
+          label={progress.label}
+          onCancel={() => controller?.abort()}
+        />
+      )}
     </div>
   )
 }

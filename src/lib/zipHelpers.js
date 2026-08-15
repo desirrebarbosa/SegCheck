@@ -46,10 +46,15 @@ export async function readZipEntries(zipFile) {
 // natural unit callers already show counts in ("12 failed masks"), rather
 // than one per individual blob fetch (photos are deduped and skip-fetched,
 // so that count wouldn't line up with anything the UI displays).
+//
+// `signal`, if given, cancels the batch: workers stop picking up new rows
+// and downloadBlob aborts whatever fetch it's mid-flight on, so cancelling
+// stops network work immediately rather than draining the queue first.
 export async function collectPhotoMaskEntries(
   rows,
   { photoDir = 'photos', maskDir = 'masks' } = {},
   onProgress,
+  signal,
 ) {
   const photoBlobs = new Map() // photo_id -> blob
   const maskBlobs = new Map() // row.id -> blob
@@ -61,6 +66,7 @@ export async function collectPhotoMaskEntries(
   let next = 0
   async function worker() {
     while (next < rows.length) {
+      signal?.throwIfAborted()
       const i = next++
       const r = rows[i]
 
@@ -68,7 +74,7 @@ export async function collectPhotoMaskEntries(
       // fetches even when multiple workers hit the same photo_id at once.
       let fetch = photoFetches.get(r.photo_id)
       if (!fetch) {
-        fetch = downloadBlob(r.photo_storage_path)
+        fetch = downloadBlob(r.photo_storage_path, { signal })
         photoFetches.set(r.photo_id, fetch)
         photoFiles.set(r.photo_id, { path: `${photoDir}/${r.photo_filename}`, blob: null })
       }
@@ -77,7 +83,7 @@ export async function collectPhotoMaskEntries(
       photoFiles.get(r.photo_id).blob = photoBlob
 
       if (r.storage_path) {
-        const maskBlob = await downloadBlob(r.storage_path)
+        const maskBlob = await downloadBlob(r.storage_path, { signal })
         maskBlobs.set(r.id, maskBlob)
         const maskName = r.storage_path.split('/').pop()
         maskFiles[i] = { path: `${maskDir}/${r.photo_filename}/${maskName}`, blob: maskBlob }
@@ -95,7 +101,14 @@ export async function collectPhotoMaskEntries(
 // Builds a zip from [{ path, blob }] entries and triggers a browser
 // download. `onProgress(percent)` mirrors JSZip's own compression progress
 // (0-100) — the last leg of an export, after files are already collected.
-export async function downloadZip(filename, files, onProgress) {
+//
+// `signal`, if given and already aborted, skips zipping entirely; JSZip
+// itself has no mid-compression abort hook, so a cancel that lands while
+// this is running still finishes the (fast, STORE-only) compression pass
+// but is caught right after — before the file is actually handed to the
+// browser to save.
+export async function downloadZip(filename, files, onProgress, signal) {
+  signal?.throwIfAborted()
   const zip = new JSZip()
   for (const f of files) zip.file(f.path, f.blob)
   // These entries are already-compressed photos/masks/previews (plus a
@@ -104,6 +117,7 @@ export async function downloadZip(filename, files, onProgress) {
   const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' }, (metadata) => {
     onProgress?.(metadata.percent)
   })
+  signal?.throwIfAborted()
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url

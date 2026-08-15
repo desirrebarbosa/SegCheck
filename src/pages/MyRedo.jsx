@@ -15,6 +15,7 @@ export default function MyRedo() {
   const [me, setMe] = useState(null) // { id, email }
   const [downloading, setDownloading] = useState(false)
   const [progress, setProgress] = useState(null) // { phase, done, total }
+  const [controller, setController] = useState(null) // AbortController for the in-flight download
 
   useEffect(() => {
     let alive = true
@@ -41,6 +42,8 @@ export default function MyRedo() {
   }, [projectId, showError])
 
   async function handleDownload() {
+    const abortController = new AbortController()
+    setController(abortController)
     setDownloading(true)
     setProgress(null)
     try {
@@ -50,14 +53,20 @@ export default function MyRedo() {
         filenamePrefix: `${project?.name ?? 'my'}-redo`,
         membersById,
         onProgress: setProgress,
+        signal: abortController.signal,
       })
       showSuccess('Redo batch downloaded.')
     } catch (e) {
-      console.error('exportRedoBatch failed:', e)
-      showError('Could not build your redo batch.')
+      if (abortController.signal.aborted) {
+        showSuccess('Redo batch download cancelled.')
+      } else {
+        console.error('exportRedoBatch failed:', e)
+        showError('Could not build your redo batch.')
+      }
     } finally {
       setDownloading(false)
       setProgress(null)
+      setController(null)
     }
   }
 
@@ -84,6 +93,7 @@ export default function MyRedo() {
         <ProgressBar
           percent={exportOverallPercent(progress)}
           label={`${exportPhaseLabel(progress)}…`}
+          onCancel={() => controller?.abort()}
         />
       )}
 

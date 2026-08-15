@@ -46,13 +46,28 @@ export function exportPhaseLabel(progress) {
 // 'download' and 'render' phases — an export over a slow connection or a
 // large batch can take a while, and this is what lets a caller show real
 // progress instead of a bar that just sits there.
-export async function buildRedoZipFiles(rows, { membersById = new Map() } = {}, onProgress) {
-  const { files, photoBlobs, maskBlobs } = await collectPhotoMaskEntries(rows, {}, (done, total) => {
-    onProgress?.({ phase: 'download', done, total })
-  })
+//
+// `signal`, if given, cancels the export — checked between rows in both
+// phases, and passed down so in-flight downloads abort immediately rather
+// than finishing out the batch first.
+export async function buildRedoZipFiles(
+  rows,
+  { membersById = new Map() } = {},
+  onProgress,
+  signal,
+) {
+  const { files, photoBlobs, maskBlobs } = await collectPhotoMaskEntries(
+    rows,
+    {},
+    (done, total) => {
+      onProgress?.({ phase: 'download', done, total })
+    },
+    signal,
+  )
 
   const manifestRows = []
   for (let i = 0; i < rows.length; i++) {
+    signal?.throwIfAborted()
     const r = rows[i]
     const instanceKey = r.manifest_mask_id ?? r.id
     const photoBlob = photoBlobs.get(r.photo_id)
@@ -151,11 +166,21 @@ export function buildInstanceManifestCsv(manifestRows) {
 // Dashboard's global export, Dashboard's per-member export, and MyRedo's
 // self-export — one implementation instead of three copies of the same
 // zip-building loop.
-export async function exportRedoBatch({ rows, filenamePrefix, membersById, onProgress }) {
+export async function exportRedoBatch({ rows, filenamePrefix, membersById, onProgress, signal }) {
   const failed = rows.filter((r) => r.status === 'fail')
-  const { files, manifestRows } = await buildRedoZipFiles(failed, { membersById }, onProgress)
+  const { files, manifestRows } = await buildRedoZipFiles(
+    failed,
+    { membersById },
+    onProgress,
+    signal,
+  )
   files.push({ path: 'manifest.csv', blob: buildInstanceManifestCsv(manifestRows) })
-  await downloadZip(`${filenamePrefix}-redo.zip`, files, (percent) => {
-    onProgress?.({ phase: 'zip', done: percent, total: 100 })
-  })
+  await downloadZip(
+    `${filenamePrefix}-redo.zip`,
+    files,
+    (percent) => {
+      onProgress?.({ phase: 'zip', done: percent, total: 100 })
+    },
+    signal,
+  )
 }
