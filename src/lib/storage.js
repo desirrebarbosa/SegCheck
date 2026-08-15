@@ -17,8 +17,11 @@ export async function getSignedUrl(path, expiresIn = 3600) {
 }
 
 // Fetches the raw file back as a Blob (used for building the redo zip).
-export async function downloadBlob(path) {
-  const { data, error } = await supabase.storage.from(BUCKET).download(path)
+// `signal`, if given, cancels the in-flight network request — not just a
+// local no-op, an actually-aborted fetch — so cancelling a batch export
+// stops burning bandwidth on downloads nobody's waiting for anymore.
+export async function downloadBlob(path, { signal } = {}) {
+  const { data, error } = await supabase.storage.from(BUCKET).download(path, {}, { signal })
   if (error) throw error
   return data
 }

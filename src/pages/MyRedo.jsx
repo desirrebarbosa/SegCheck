@@ -4,12 +4,18 @@ import { supabase } from '../lib/supabaseClient'
 import { fetchMyRedoAssignments } from '../lib/projects'
 import { getSignedUrl } from '../lib/storage'
 import { fetchGuide, isGuideApiConfigured } from '../lib/guideApi'
+import { exportRedoBatch, exportOverallPercent, exportPhaseLabel } from '../lib/exportRedo'
 import { useToast } from '../components/Toast'
+import ProgressBar from '../components/ProgressBar'
 
 export default function MyRedo() {
-  const { projectId } = useOutletContext()
-  const { showError } = useToast()
+  const { projectId, project } = useOutletContext()
+  const { showError, showSuccess } = useToast()
   const [items, setItems] = useState(null) // null = loading
+  const [me, setMe] = useState(null) // { id, email }
+  const [downloading, setDownloading] = useState(false)
+  const [progress, setProgress] = useState(null) // { phase, done, total }
+  const [controller, setController] = useState(null) // AbortController for the in-flight download
 
   useEffect(() => {
     let alive = true
@@ -17,6 +23,7 @@ export default function MyRedo() {
       const {
         data: { user },
       } = await supabase.auth.getUser()
+      if (alive) setMe(user ? { id: user.id, email: user.email } : null)
       try {
         const rows = await fetchMyRedoAssignments(projectId, user.id)
         if (alive) setItems(rows)
@@ -34,12 +41,61 @@ export default function MyRedo() {
     }
   }, [projectId, showError])
 
+  async function handleDownload() {
+    const abortController = new AbortController()
+    setController(abortController)
+    setDownloading(true)
+    setProgress(null)
+    try {
+      const membersById = me ? new Map([[me.id, { email: me.email }]]) : undefined
+      await exportRedoBatch({
+        rows: items,
+        filenamePrefix: `${project?.name ?? 'my'}-redo`,
+        membersById,
+        onProgress: setProgress,
+        signal: abortController.signal,
+      })
+      showSuccess('Redo batch downloaded.')
+    } catch (e) {
+      if (abortController.signal.aborted) {
+        showSuccess('Redo batch download cancelled.')
+      } else {
+        console.error('exportRedoBatch failed:', e)
+        showError('Could not build your redo batch.')
+      }
+    } finally {
+      setDownloading(false)
+      setProgress(null)
+      setController(null)
+    }
+  }
+
   return (
     <section>
-      <h2 className="text-lg font-medium">My Redo</h2>
-      <p className="mt-1 text-sm text-[#888780]">
-        Failed Masks from QA Review, manually annotate them and upload again.
-      </p>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h2 className="text-lg font-medium">My Redo</h2>
+          <p className="mt-1 text-sm text-[#888780]">
+            Failed Masks from QA Review, manually annotate them and upload again.
+          </p>
+        </div>
+        <button
+          onClick={handleDownload}
+          disabled={downloading || !items?.length}
+          className="flex items-center gap-1.5 rounded-lg bg-[#D85A30] px-3.5 py-2 text-sm font-medium text-white disabled:opacity-50"
+        >
+          <i className="ti ti-package text-base" aria-hidden="true"></i>
+          {downloading ? 'Working…' : `Download my redo batch (${items?.length ?? 0})`}
+        </button>
+      </div>
+
+      {progress && (
+        <ProgressBar
+          percent={exportOverallPercent(progress)}
+          label={`${exportPhaseLabel(progress)}…`}
+          onCancel={() => controller?.abort()}
+        />
+      )}
 
       {!isGuideApiConfigured() && (
         <p className="mt-3 rounded-lg bg-[#F1EFE8] px-3 py-2 text-xs text-[#5F5E5A]">

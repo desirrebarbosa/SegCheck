@@ -295,7 +295,8 @@ export async function fetchMyRedoAssignments(projectId, reviewerId) {
   const { data, error } = await supabase
     .from('active_masks')
     .select(
-      `id, category, bbox, storage_path,
+      `id, status, category, bbox, segmentation, storage_path, is_missing,
+       manifest_mask_id, assigned_to,
        photo_id, photo_filename, photo_storage_path, created_at`,
     )
     .eq('project_id', projectId)
