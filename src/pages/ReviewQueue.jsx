@@ -17,7 +17,7 @@ const QUEUE_BATCH_SIZE = 25
 const REFILL_THRESHOLD = 5
 
 const MASK_COLUMNS = `id, manifest_mask_id, storage_path, category, bbox, segmentation, is_crowd,
-         photo_id, photo_filename, photo_storage_path, created_at`
+         photo_id, photo_filename, photo_storage_path, created_at, reviewed_at`
 
 export default function ReviewQueue() {
   const { projectId } = useOutletContext()
@@ -69,6 +69,10 @@ export default function ReviewQueue() {
         .eq('project_id', projectId)
         .eq('status', 'pending'),
     )
+      // Not-yet-skipped masks (reviewed_at still null) come first by creation
+      // order; skipped ones sort after, oldest-skip-first — see decide()'s
+      // skip handler below for why reviewed_at gets bumped on skip.
+      .order('reviewed_at', { ascending: true, nullsFirst: true })
       .order('created_at', { ascending: true })
       .limit(QUEUE_BATCH_SIZE)
     setQueueLoading(false)
@@ -82,8 +86,10 @@ export default function ReviewQueue() {
   }, [projectId, showError, userId, scopeToMode])
 
   const fetchMore = useCallback(
-    async (afterCreatedAt) => {
+    async (offset) => {
       if (!userId) return []
+      // Range-based rather than a created_at cursor: the two-column sort
+      // above can't be paged correctly with a single-column cursor.
       const { data, error } = await scopeToMode(
         supabase
           .from('active_masks')
@@ -91,9 +97,9 @@ export default function ReviewQueue() {
           .eq('project_id', projectId)
           .eq('status', 'pending'),
       )
-        .gt('created_at', afterCreatedAt)
+        .order('reviewed_at', { ascending: true, nullsFirst: true })
         .order('created_at', { ascending: true })
-        .limit(QUEUE_BATCH_SIZE)
+        .range(offset, offset + QUEUE_BATCH_SIZE - 1)
       if (error) {
         console.error('fetchMore failed:', error)
         return []
@@ -108,9 +114,8 @@ export default function ReviewQueue() {
   useEffect(() => {
     if (queue.length === 0) return
     if (queueIndex < queue.length - REFILL_THRESHOLD) return
-    const last = queue[queue.length - 1]
     let cancelled = false
-    fetchMore(last.created_at).then((more) => {
+    fetchMore(queue.length).then((more) => {
       if (cancelled || more.length === 0) return
       setQueue((q) => {
         const existingIds = new Set(q.map((m) => m.id))
@@ -194,6 +199,21 @@ export default function ReviewQueue() {
 
   function goNext() {
     setQueueIndex((i) => Math.min(queue.length - 1, i + 1))
+  }
+
+  // Persists the skip so it sticks to the back of the line on reload/other
+  // devices too, not just for this session. Fire-and-forget: the local
+  // skip (goNext) already happened, and a failed bump just means this one
+  // mask's position won't persist — not worth blocking the UI over.
+  function skipMask(maskId) {
+    supabase
+      .from('masks')
+      .update({ reviewed_at: new Date().toISOString() })
+      .eq('id', maskId)
+      .eq('status', 'pending')
+      .then(({ error }) => {
+        if (error) console.error('skipMask failed:', error)
+      })
   }
 
   async function decide(status) {
@@ -389,7 +409,10 @@ export default function ReviewQueue() {
                 </span>
                 <button
                   disabled={!canGoNext}
-                  onClick={goNext}
+                  onClick={() => {
+                    if (mask) skipMask(mask.id)
+                    goNext()
+                  }}
                   aria-label="Skip to next, come back later"
                   title="Not sure yet — skip for now"
                   className="flex h-8 w-8 items-center justify-center rounded-full text-[#5F5E5A] transition hover:bg-[#F1EFE8] disabled:cursor-not-allowed disabled:opacity-30"
