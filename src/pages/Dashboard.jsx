@@ -6,8 +6,9 @@ import { collectPhotoMaskEntries, downloadZip } from '../lib/zipHelpers'
 import { exportRedoBatch, exportOverallPercent, exportPhaseLabel } from '../lib/exportRedo'
 import { listMembers, fetchMyRedoAssignments } from '../lib/projects'
 import { listPhotosForManagement, deletePhotosWithStorage, deleteProject } from '../lib/admin'
-import { useToast } from '../components/Toast'
+import { selectAll } from '../lib/paging'
 import ProgressBar from '../components/ProgressBar'
+import { useToast } from '../components/Toast'
 
 // Count-only queries (head: true) instead of fetching every active_masks
 // row just to tally them — cheap regardless of project size. Full rows are
@@ -29,29 +30,40 @@ async function fetchStatusCounts(projectId) {
   return counts
 }
 
+// Paged. This backs both the CSV export and the redo zip, and PostgREST
+// caps a plain select at 1000 rows — so on this project's ~4k masks the
+// "Download redo batch (3910)" button was building a zip of the first 1000
+// and reporting success. Silently short exports are the worst kind.
 async function fetchAllActiveMasks(projectId) {
-  const { data, error } = await supabase
-    .from('active_masks')
-    .select(
-      `id, status, is_missing, category, storage_path, bbox, segmentation,
+  return selectAll(
+    () =>
+      supabase
+        .from('active_masks')
+        .select(
+          `id, status, is_missing, category, storage_path, bbox, segmentation,
        manifest_mask_id, assigned_to,
        photo_id, photo_filename, photo_storage_path`,
-    )
-    .eq('project_id', projectId)
-  if (error) throw error
-  return data
+        )
+        .eq('project_id', projectId),
+    { orderBy: 'id' },
+  )
 }
 
 // Splits that actually have at least one accepted (pass) mask, with counts
 // — used to render one "download" button per split rather than guessing
 // which splits exist or forcing one giant combined zip.
 async function fetchPassedSplitCounts(projectId) {
-  const { data, error } = await supabase
-    .from('active_masks')
-    .select('photo_split')
-    .eq('project_id', projectId)
-    .eq('status', 'pass')
-  if (error) throw error
+  // Paged — these counts label the download buttons, so a truncated read
+  // understates every split and makes a complete export look incomplete.
+  const data = await selectAll(
+    () =>
+      supabase
+        .from('active_masks')
+        .select('id, photo_split')
+        .eq('project_id', projectId)
+        .eq('status', 'pass'),
+    { orderBy: 'id' },
+  )
   const counts = new Map()
   for (const row of data) {
     const key = row.photo_split ?? '(no split)'
@@ -60,16 +72,23 @@ async function fetchPassedSplitCounts(projectId) {
   return counts
 }
 
+// Paged, same reason as the redo batch: this is the accepted-dataset export
+// and a short read means a silently incomplete dataset handed to whoever
+// consumes it downstream.
 async function fetchPassedForSplit(projectId, split) {
-  let query = supabase
-    .from('active_masks')
-    .select('id, storage_path, photo_id, photo_filename, photo_storage_path')
-    .eq('project_id', projectId)
-    .eq('status', 'pass')
-  query = split === '(no split)' ? query.is('photo_split', null) : query.eq('photo_split', split)
-  const { data, error } = await query
-  if (error) throw error
-  return data
+  return selectAll(
+    () => {
+      const query = supabase
+        .from('active_masks')
+        .select('id, storage_path, photo_id, photo_filename, photo_storage_path')
+        .eq('project_id', projectId)
+        .eq('status', 'pass')
+      return split === '(no split)'
+        ? query.is('photo_split', null)
+        : query.eq('photo_split', split)
+    },
+    { orderBy: 'id' },
+  )
 }
 
 export default function Dashboard() {
@@ -150,8 +169,15 @@ export default function Dashboard() {
         membersById,
         onProgress: setRedoProgress,
         signal: controller.signal,
+        // Scoped to one member: this is that person's batch, so claim it for
+        // them. The unscoped "everyone" export spans the whole project and
+        // is deliberately NOT claimed — it is a copy to inspect, and locking
+        // the entire backlog to whoever pressed the button would be wrong.
+        projectId: assigneeId ? projectId : undefined,
+        reviewerId: assigneeId || undefined,
       })
       showSuccess('Redo batch downloaded.')
+      setTimeout(() => setZipProgress(null), 400)
     } catch (e) {
       if (controller.signal.aborted) {
         showSuccess('Redo batch download cancelled.')
@@ -370,6 +396,7 @@ function ManagePhotos({ projectId, onChanged }) {
   const [thumbUrls, setThumbUrls] = useState({})
   const [selected, setSelected] = useState(new Set())
   const [busy, setBusy] = useState(false)
+  const [deleteProgress, setDeleteProgress] = useState(null) // null = hidden
 
   const load = useCallback(async () => {
     try {
@@ -414,11 +441,15 @@ function ManagePhotos({ projectId, onChanged }) {
     )
       return
     setBusy(true)
+    setDeleteProgress(0)
     try {
-      await deletePhotosWithStorage(projectId, chosen)
+      await deletePhotosWithStorage(projectId, chosen, {
+        onProgress: (done, total) => setDeleteProgress(total ? done / total : 1),
+      })
       setSelected(new Set())
       await load()
       onChanged?.()
+      setTimeout(() => setDeleteProgress(null), 400)
       showSuccess(`Deleted ${chosen.length} photo(s).`)
     } catch (e) {
       console.error('deletePhotosWithStorage failed:', e)
@@ -448,6 +479,11 @@ function ManagePhotos({ projectId, onChanged }) {
 
           {result && result.photos.length > 0 && (
             <>
+              {deleteProgress !== null && (
+                <div className="mb-2">
+                  <ProgressBar percent={deleteProgress * 100} label="Deleting" />
+                </div>
+              )}
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-xs text-[#888780]">{selected.size} selected</span>
                 <button

@@ -2,6 +2,7 @@ import { supabase } from './supabaseClient'
 import { uploadFile } from './storage'
 import { makeThumbnail } from './thumbnails'
 import { rebalanceAllAssignments } from './projects'
+import { selectAll } from './paging'
 
 // How many photos (and, separately, how many mask files within one photo)
 // are processed at once. Bounded rather than unbounded `Promise.all` so we
@@ -22,6 +23,34 @@ async function mapWithConcurrency(items, limit, fn) {
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
   return results
+}
+
+// Clears `assigned_to` on every mask belonging to a photo's existing
+// versions. Called just before a re-upload supersedes them.
+//
+// A superseded mask keeps its status but drops out of `active_masks`, which
+// is what every page reads. Anything still assigned on one is invisible
+// work: it sits in a member's name, counts against them nowhere the UI can
+// show, and can never be actioned. Status is deliberately left alone — the
+// row is history for an old version, not work to redo. Only the pointer at
+// a person is wrong.
+async function releaseSupersededAssignments(photoId) {
+  const { data: versions, error: vErr } = await supabase
+    .from('photo_versions')
+    .select('id')
+    .eq('photo_id', photoId)
+  if (vErr) throw vErr
+  if (versions.length === 0) return
+
+  const { error } = await supabase
+    .from('masks')
+    .update({ assigned_to: null })
+    .in(
+      'photo_version_id',
+      versions.map((v) => v.id),
+    )
+    .not('assigned_to', 'is', null)
+  if (error) throw error
 }
 
 // Commits ONE split's plan (from buildUploadPlanForSplit / the `plan` array
@@ -47,12 +76,16 @@ export async function commitSplitPlan({ projectId, split, userId, plan, onProgre
 
   // Pre-fetch every existing photo for this project+split in one query,
   // instead of one `select` per photo in the loop below.
-  const { data: existingPhotos, error: existErr } = await supabase
-    .from('photos')
-    .select('*')
-    .eq('project_id', projectId)
-    .eq('split', split)
-  if (existErr) throw existErr
+  // Paged: this map decides "already uploaded → make a new version" vs
+  // "never seen → insert a new photo". Truncated at 1000, every photo past
+  // the cap looked new, so a re-upload would insert a DUPLICATE photos row
+  // instead of versioning the existing one — splitting that photo's history
+  // in two and leaving the original's masks stranded on a row nothing points
+  // at any more.
+  const existingPhotos = await selectAll(
+    () => supabase.from('photos').select('*').eq('project_id', projectId).eq('split', split),
+    { orderBy: 'id' },
+  )
   const existingByFilename = new Map(existingPhotos.map((p) => [p.filename, p]))
 
   let done = 0
@@ -106,6 +139,10 @@ export async function commitSplitPlan({ projectId, split, userId, plan, onProgre
         detail: { filename, split },
       })
     } else {
+      // Before anything is mutated, so a failure here aborts with the photo
+      // untouched rather than leaving a bumped latest_version behind.
+      await releaseSupersededAssignments(photo.id)
+
       const nextVersion = photo.latest_version + 1
       const { error: updErr } = await supabase
         .from('photos')
@@ -231,11 +268,18 @@ export async function commitMultiSplitPlan({ projectId, userId, bySplit }) {
   // members — same "unassigned pool only, never steal existing work"
   // rebalance used at member-add time, so a fresh upload's redo backlog
   // doesn't require any manual step to get routed.
+  // Non-fatal — the upload itself already succeeded — but RETURNED rather
+  // than only logged, so the caller can tell someone. A silently failed
+  // distribution leaves fail masks unassigned and in nobody's My Redo, with
+  // the dashboard still counting them: a gap that is invisible until
+  // somebody runs a SQL query.
+  let distributionError = null
   try {
     await rebalanceAllAssignments(projectId)
   } catch (e) {
     console.error('rebalanceAllAssignments after upload failed:', e)
+    distributionError = e
   }
 
-  return { perSplit, total }
+  return { perSplit, total, distributionError }
 }

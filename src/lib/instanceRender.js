@@ -98,7 +98,13 @@ export function loadImage(src) {
     const img = new Image()
     img.crossOrigin = 'anonymous'
     img.onload = () => resolve(img)
-    img.onerror = reject
+    // `onerror` hands back a DOM Event, which has no `.message` — passing it
+    // straight to reject rendered an empty error box that told you nothing.
+    // The browser deliberately withholds the real cause here (same opaque
+    // event for a 404, a CORS rejection and a corrupt file), so name the
+    // realistic candidates instead.
+    img.onerror = () =>
+      reject(new Error('the file is missing, blocked by CORS, or not a valid image.'))
     img.src = src
   })
 }
