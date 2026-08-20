@@ -1,5 +1,6 @@
 import { supabase } from './supabaseClient'
 import { distributeEvenly } from './redoDistribution'
+import { selectAll } from './paging'
 
 // All queries below are further constrained by RLS, so they only ever return
 // projects/members the signed-in reviewer is allowed to see.
@@ -74,30 +75,124 @@ export async function getMyMembership(projectId) {
   return data // null if not a member
 }
 
+// Just the roster. The per-member redo tally that used to live here has
+// moved to fetchMemberProgress(), which reports it alongside everything else
+// — keeping a second query for the same number only created a way for the
+// two to disagree. (It also read raw `masks`, so it counted assignments on
+// superseded photo versions and could show more redo than My Redo listed.)
 export async function listMembers(projectId) {
   const { data, error } = await supabase
     .from('project_members')
     .select('is_lead, added_at, reviewer:reviewers(id, email, display_name)')
     .eq('project_id', projectId)
   if (error) throw error
+  return data
+}
 
-  // Per-member count of fail masks currently assigned to them.
-  const { data: assigned, error: aErr } = await supabase
-    .from('masks')
-    .select('assigned_to')
-    .eq('project_id', projectId)
-    .eq('status', 'fail')
-    .not('assigned_to', 'is', null)
-  if (aErr) throw aErr
-  const countsByReviewer = new Map()
-  for (const row of assigned) {
-    countsByReviewer.set(row.assigned_to, (countsByReviewer.get(row.assigned_to) ?? 0) + 1)
+// Per-member numbers, for the Members page and the Dashboard leaderboard.
+// Keyed by reviewer id; every listed member gets an entry.
+//
+// The two halves come from deliberately different places:
+//
+//   - Outstanding load (`pending`, `redo`) from `active_masks` — what the
+//     person can actually see in their review queue and My Redo right now.
+//     Raw `masks` would include superseded photo versions, i.e. work that
+//     is assigned to them but renders nowhere.
+//
+//   - Work completed (`passed`, `failed`, `redone`) from `review_logs`, NOT
+//     from masks.reviewed_by. A redo upload resets reviewed_by to null (see
+//     commitRedoUploadPlan), so counting masks would quietly erase a
+//     reviewer's credit for every mask they failed that was later
+//     re-annotated — which is precisely the work worth showing. review_logs
+//     is append-only, so it is the only honest record of who did how much.
+//
+// All count-only (`head: true`, no rows returned), run in parallel — the
+// same shape as the load counts in rebalanceAssignments. Cost is one small
+// request per member per metric, which is fine for a project roster; if a
+// roster ever grows past a few dozen people this wants a SQL view instead.
+export async function fetchMemberProgress(projectId, reviewerIds) {
+  const countMasks = async (reviewerId, status) => {
+    const { count, error } = await supabase
+      .from('active_masks')
+      .select('id', { count: 'exact', head: true })
+      .eq('project_id', projectId)
+      .eq('status', status)
+      .eq('assigned_to', reviewerId)
+    if (error) throw error
+    return count ?? 0
   }
 
-  return data.map((m) => ({
-    ...m,
-    redo_count: countsByReviewer.get(m.reviewer.id) ?? 0,
-  }))
+  const countLogs = async (reviewerId, action) => {
+    // Counted on created_at rather than id: PostgREST validates the column
+    // list even for a head-only count, and created_at is the one column
+    // review_logs is already read by elsewhere (fetchWeeklyActivity).
+    const { count, error } = await supabase
+      .from('review_logs')
+      .select('created_at', { count: 'exact', head: true })
+      .eq('project_id', projectId)
+      .eq('reviewer_id', reviewerId)
+      .eq('action', action)
+    // `action` is a Postgres enum, so filtering on a label the enum does not
+    // have is a 22P02 cast error rather than an empty result. That is not a
+    // reason to blank the whole progress panel — a value the database has
+    // never seen has, definitionally, a count of zero. Keeps the page
+    // working when the code ships ahead of the enum migration.
+    if (error?.code === '22P02') return 0
+    if (error) throw error
+    return count ?? 0
+  }
+
+  const lastActivity = async (reviewerId) => {
+    const { data, error } = await supabase
+      .from('review_logs')
+      .select('created_at')
+      .eq('project_id', projectId)
+      .eq('reviewer_id', reviewerId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    if (error) throw error
+    return data?.created_at ?? null
+  }
+
+  const entries = await Promise.all(
+    reviewerIds.map(async (id) => {
+      const [pending, redo, passed, failed, redone, lastActivityAt] = await Promise.all([
+        countMasks(id, 'pending'),
+        countMasks(id, 'fail'),
+        countLogs(id, 'confirm_pass'),
+        countLogs(id, 'confirm_fail'),
+        countLogs(id, 'redo_upload'),
+        lastActivity(id),
+      ])
+      // `qad` — pass + fail decisions — is the "how much reviewing did this
+      // person actually do" number, and what the leaderboard ranks on.
+      return [id, { pending, redo, passed, failed, qad: passed + failed, redone, lastActivityAt }]
+    }),
+  )
+
+  return Object.fromEntries(entries)
+}
+
+// Roster joined to progress, ranked by masks reviewed. Ties break on passed
+// then on name, so the order is stable rather than dependent on whatever
+// order the roster query happened to return.
+export async function fetchReviewLeaderboard(projectId) {
+  const members = await listMembers(projectId)
+  const progress = await fetchMemberProgress(
+    projectId,
+    members.map((m) => m.reviewer.id),
+  )
+  return members
+    .map((m) => ({ reviewer: m.reviewer, is_lead: m.is_lead, ...progress[m.reviewer.id] }))
+    .sort(
+      (a, b) =>
+        b.qad - a.qad ||
+        b.passed - a.passed ||
+        (a.reviewer.display_name || a.reviewer.email).localeCompare(
+          b.reviewer.display_name || b.reviewer.email,
+        ),
+    )
 }
 
 // Add an existing SegCheck account to the project by email, then give them
@@ -169,14 +264,30 @@ export async function rebalanceAssignments(projectId, status) {
 
   // Paged: PostgREST caps a plain select at 1000 rows, which would
   // silently leave the rest of a large backlog undistributed.
+  //
+  // Read through `active_masks`, NOT raw `masks`. Masks belong to a photo
+  // version, and re-uploading a photo supersedes the previous version's
+  // masks — they keep their status but drop out of `active_masks`, which is
+  // what every reader (My Redo, the review queue, the dashboard) goes
+  // through. Distributing from raw `masks` therefore handed people work on
+  // superseded versions that no page can render: invisible assignments that
+  // sit in someone's name forever. The write below still targets `masks` by
+  // id, so nothing here depends on the view being updatable.
   const unassigned = []
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supabase
-      .from('masks')
+      .from('active_masks')
       .select('id')
       .eq('project_id', projectId)
       .eq('status', status)
       .is('assigned_to', null)
+      // ORDER BY is not optional here. Postgres gives no row-order guarantee
+      // without one, so paging with .range() alone can return a row twice
+      // across two pages — harmless — or skip one entirely, which silently
+      // leaves that mask undistributed and in nobody's list. At 3900+ fails
+      // that is four pages of exposure. It self-heals (the next rebalance
+      // picks the row up) which is exactly why it went unnoticed.
+      .order('id', { ascending: true })
       .range(from, from + PAGE - 1)
     if (error) throw error
     unassigned.push(...data)
@@ -189,6 +300,10 @@ export async function rebalanceAssignments(projectId, status) {
   // (head:true, no rows returned) rather than by tallying every assigned
   // row client-side — exact regardless of backlog size, and it naturally
   // ignores rows pointing at someone who's no longer a member.
+  // Counted through `active_masks` for the same reason as the pool above:
+  // counting raw `masks` inflated a member's load with superseded rows, so
+  // the leveller believed they were busier than they were and routed real
+  // work away from them.
   // Seeded in member order first: Map iteration order is insertion order,
   // and these counts resolve in whatever order the network returns them.
   // distributeEvenly breaks ties by iteration order, so seeding keeps the
@@ -197,7 +312,7 @@ export async function rebalanceAssignments(projectId, status) {
   await Promise.all(
     members.map(async (m) => {
       const { count, error } = await supabase
-        .from('masks')
+        .from('active_masks')
         .select('id', { count: 'exact', head: true })
         .eq('project_id', projectId)
         .eq('status', status)
@@ -292,18 +407,22 @@ export async function fetchHelpablePendingCount(projectId, reviewerId) {
 // Read-only: the redo (fail) masks currently assigned to one reviewer, for
 // the dedicated "My Redo" list.
 export async function fetchMyRedoAssignments(projectId, reviewerId) {
-  const { data, error } = await supabase
-    .from('active_masks')
-    .select(
-      `id, category, bbox, storage_path,
+  // Paged: one person's share of a few thousand fails is comfortably over
+  // PostgREST's 1000-row cap, so a bare select silently cut their list short
+  // — the work was assigned to them and simply never shown.
+  return selectAll(
+    () =>
+      supabase
+        .from('active_masks')
+        .select(
+          `id, category, bbox, storage_path,
        photo_id, photo_filename, photo_storage_path, created_at`,
-    )
-    .eq('project_id', projectId)
-    .eq('status', 'fail')
-    .eq('assigned_to', reviewerId)
-    .order('created_at', { ascending: true })
-  if (error) throw error
-  return data
+        )
+        .eq('project_id', projectId)
+        .eq('status', 'fail')
+        .eq('assigned_to', reviewerId),
+    { orderBy: 'id' },
+  )
 }
 
 // Remove a member from a project. Gated to owner-only in the UI (RLS also
@@ -366,18 +485,25 @@ export async function fetchWeeklyActivity(projectId) {
   since.setHours(0, 0, 0, 0)
   since.setDate(since.getDate() - 6)
 
-  const { data, error } = await supabase
-    .from('review_logs')
-    .select('created_at')
-    .eq('project_id', projectId)
-    .gte('created_at', since.toISOString())
-  if (error) throw error
-
-  const counts = Array(7).fill(0)
-  for (const row of data) {
-    const dayIndex = Math.floor((new Date(row.created_at) - since) / 86400000)
-    if (dayIndex >= 0 && dayIndex < 7) counts[dayIndex] += 1
-  }
+  // One count-only query per day rather than fetching a week of rows and
+  // tallying them here. The old shape hit PostgREST's 1000-row cap on any
+  // busy week and undercounted the sparkline without erroring — and on a
+  // quiet week it pulled rows it only ever needed the length of.
+  const DAY = 86400000
+  const counts = await Promise.all(
+    Array.from({ length: 7 }, async (_, i) => {
+      const from = new Date(since.getTime() + i * DAY)
+      const to = new Date(since.getTime() + (i + 1) * DAY)
+      const { count, error } = await supabase
+        .from('review_logs')
+        .select('created_at', { count: 'exact', head: true })
+        .eq('project_id', projectId)
+        .gte('created_at', from.toISOString())
+        .lt('created_at', to.toISOString())
+      if (error) throw error
+      return count ?? 0
+    }),
+  )
   return counts
 }
 
@@ -390,11 +516,16 @@ export async function fetchWeeklyActivity(projectId) {
 // today. Kept because Feature 6's per-category guide defaults (skeleton vs
 // star-convex) need exactly this list — delete it if that lands elsewhere.
 export async function fetchProjectCategories(projectId) {
-  const { data, error } = await supabase
-    .from('masks')
-    .select('category')
-    .eq('project_id', projectId)
-    .not('category', 'is', null)
-  if (error) throw error
-  return [...new Set(data.map((r) => r.category))].sort()
+  // Paged: the distinct-categories list is derived client-side from every
+  // mask row, so a truncated read drops whole categories from the result.
+  const rows = await selectAll(
+    () =>
+      supabase
+        .from('masks')
+        .select('id, category')
+        .eq('project_id', projectId)
+        .not('category', 'is', null),
+    { orderBy: 'id' },
+  )
+  return [...new Set(rows.map((r) => r.category))].sort()
 }

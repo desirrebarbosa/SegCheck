@@ -56,6 +56,72 @@ export function decodeCocoRLE(segmentation) {
   return { width: w, height: h, data: rowMajor }
 }
 
+// The exact inverse of decodeCocoRLE: row-major mask -> COCO compressed
+// RLE. `data` is one byte per pixel (0 background, non-zero foreground) in
+// row-major order, the same shape decodeCocoRLE returns.
+//
+// Every step mirrors the decoder in reverse:
+//   1. transpose row-major -> column-major (COCO counts run down columns)
+//   2. run-length encode, ALWAYS starting with a background run — a mask
+//      whose first pixel is foreground therefore opens with a 0-length
+//      run, which is what pycocotools does too
+//   3. delta each run against the one two slots back (the decoder's
+//      `x += runs[runs.length - 2]`, undone)
+//   4. pack each value into 5-bit groups, low bits first, with 0x20 as the
+//      "more groups follow" flag and 0x10 as the sign bit of the final
+//      group, then offset by 48 into printable ASCII
+export function encodeCocoRLE(data, width, height) {
+  if (data.length !== width * height) {
+    throw new Error(`encodeCocoRLE: data length ${data.length} != ${width}x${height}`)
+  }
+
+  // Row-major (y*w + x) -> column-major (x*h + y).
+  const colMajor = new Uint8Array(width * height)
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) {
+      colMajor[x * height + y] = data[y * width + x] ? 1 : 0
+    }
+  }
+
+  // Run lengths, alternating starting from background.
+  const runs = []
+  let current = 0
+  let run = 0
+  for (let i = 0; i < colMajor.length; i++) {
+    if (colMajor[i] === current) {
+      run++
+    } else {
+      runs.push(run)
+      current = 1 - current
+      run = 1
+    }
+  }
+  runs.push(run)
+
+  let out = ''
+  for (let i = 0; i < runs.length; i++) {
+    // Undo the decoder's accumulation against two slots back. The decoder
+    // only applies it once more than two runs exist, so match that bound
+    // exactly rather than approximating it.
+    let x = runs[i]
+    if (i > 2) x -= runs[i - 2]
+
+    let more = true
+    while (more) {
+      let c = x & 0x1f
+      x >>= 5
+      // Continue if the remaining bits aren't just sign padding. 0x10 is
+      // this group's sign bit: when it's set, an all-ones remainder is
+      // still "negative and finished", not "more to come".
+      more = c & 0x10 ? x !== -1 : x !== 0
+      if (more) c |= 0x20
+      out += String.fromCharCode(c + 48)
+    }
+  }
+
+  return { size: [height, width], counts: out }
+}
+
 // True if this looks like a COCO RLE object (as opposed to a polygon array).
 export function isRLE(segmentation) {
   return (

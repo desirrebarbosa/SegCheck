@@ -4,6 +4,10 @@ import { supabase } from '../lib/supabaseClient'
 import { downloadBlob, getSignedUrl } from '../lib/storage'
 import { downloadZip } from '../lib/zipHelpers'
 import { listPhotosForManagement, deletePhotosWithStorage, deleteProject } from '../lib/admin'
+import { fetchReviewLeaderboard } from '../lib/projects'
+import { selectAll } from '../lib/paging'
+import { relativeTime } from '../lib/relativeTime'
+import ProgressBar from '../components/ProgressBar'
 import { useToast } from '../components/Toast'
 
 // Count-only queries (head: true) instead of fetching every active_masks
@@ -65,28 +69,39 @@ async function fetchStatusCounts(projectId) {
   return counts
 }
 
+// Paged. This backs both the CSV export and the redo zip, and PostgREST
+// caps a plain select at 1000 rows — so on this project's ~4k masks the
+// "Download redo batch (3910)" button was building a zip of the first 1000
+// and reporting success. Silently short exports are the worst kind.
 async function fetchAllActiveMasks(projectId) {
-  const { data, error } = await supabase
-    .from('active_masks')
-    .select(
-      `id, status, is_missing, category, storage_path,
+  return selectAll(
+    () =>
+      supabase
+        .from('active_masks')
+        .select(
+          `id, status, is_missing, category, storage_path,
        photo_id, photo_filename, photo_storage_path`,
-    )
-    .eq('project_id', projectId)
-  if (error) throw error
-  return data
+        )
+        .eq('project_id', projectId),
+    { orderBy: 'id' },
+  )
 }
 
 // Splits that actually have at least one accepted (pass) mask, with counts
 // — used to render one "download" button per split rather than guessing
 // which splits exist or forcing one giant combined zip.
 async function fetchPassedSplitCounts(projectId) {
-  const { data, error } = await supabase
-    .from('active_masks')
-    .select('photo_split')
-    .eq('project_id', projectId)
-    .eq('status', 'pass')
-  if (error) throw error
+  // Paged — these counts label the download buttons, so a truncated read
+  // understates every split and makes a complete export look incomplete.
+  const data = await selectAll(
+    () =>
+      supabase
+        .from('active_masks')
+        .select('id, photo_split')
+        .eq('project_id', projectId)
+        .eq('status', 'pass'),
+    { orderBy: 'id' },
+  )
   const counts = new Map()
   for (const row of data) {
     const key = row.photo_split ?? '(no split)'
@@ -95,16 +110,23 @@ async function fetchPassedSplitCounts(projectId) {
   return counts
 }
 
+// Paged, same reason as the redo batch: this is the accepted-dataset export
+// and a short read means a silently incomplete dataset handed to whoever
+// consumes it downstream.
 async function fetchPassedForSplit(projectId, split) {
-  let query = supabase
-    .from('active_masks')
-    .select('id, storage_path, photo_id, photo_filename, photo_storage_path')
-    .eq('project_id', projectId)
-    .eq('status', 'pass')
-  query = split === '(no split)' ? query.is('photo_split', null) : query.eq('photo_split', split)
-  const { data, error } = await query
-  if (error) throw error
-  return data
+  return selectAll(
+    () => {
+      const query = supabase
+        .from('active_masks')
+        .select('id, storage_path, photo_id, photo_filename, photo_storage_path')
+        .eq('project_id', projectId)
+        .eq('status', 'pass')
+      return split === '(no split)'
+        ? query.is('photo_split', null)
+        : query.eq('photo_split', split)
+    },
+    { orderBy: 'id' },
+  )
 }
 
 export default function Dashboard() {
@@ -113,6 +135,7 @@ export default function Dashboard() {
   const navigate = useNavigate()
   const [counts, setCounts] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [zipProgress, setZipProgress] = useState(null) // null = hidden
 
   const loadCounts = useCallback(async () => {
     try {
@@ -152,11 +175,17 @@ export default function Dashboard() {
 
   async function exportRedoZip() {
     setBusy(true)
+    setZipProgress(0)
     try {
       const rows = await fetchAllActiveMasks(projectId)
       const failed = rows.filter((r) => r.status === 'fail')
       const files = []
       const seenPhotos = new Set()
+      // Reported per ROW rather than per file: a row is one mask and, the
+      // first time its photo appears, one photo download too. Counting
+      // files would make progress lurch depending on how many masks
+      // happen to share a photo.
+      let done = 0
       for (const r of failed) {
         if (!seenPhotos.has(r.photo_id)) {
           seenPhotos.add(r.photo_id)
@@ -168,13 +197,17 @@ export default function Dashboard() {
           const maskName = r.storage_path.split('/').pop()
           files.push({ path: `masks/${r.photo_filename}/${maskName}`, blob: maskBlob })
         }
+        done += 1
+        setZipProgress(done / failed.length)
       }
       files.push({ path: 'instructions.csv', blob: buildRedoInstructionsCsv(failed) })
       await downloadZip(`${project?.name ?? 'segcheck'}-redo.zip`, files)
       showSuccess('Redo batch downloaded.')
+      setTimeout(() => setZipProgress(null), 400)
     } catch (e) {
       console.error('exportRedoZip failed:', e)
       showError('Could not build the redo batch.')
+      // Left frozen where it stopped — that's where it actually failed.
     } finally {
       setBusy(false)
     }
@@ -211,6 +244,14 @@ export default function Dashboard() {
         </button>
       </div>
 
+      {zipProgress !== null && (
+        <div className="mt-3 max-w-sm">
+          <ProgressBar value={zipProgress} tone="danger" />
+        </div>
+      )}
+
+      <ReviewLeaderboard projectId={projectId} />
+
       <AnnotatedExport projectId={projectId} projectName={project?.name} />
 
       {isOwner && (
@@ -238,6 +279,86 @@ function Stat({ label, value, tone }) {
     <div className={`rounded-xl px-3 py-2.5 ${styles}`}>
       <p className="text-xl font-medium">{value ?? '…'}</p>
       <p className="text-xs opacity-70">{label}</p>
+    </div>
+  )
+}
+
+// Who has reviewed how much. The dashboard stats above are project-wide
+// totals, which cannot tell you whether one person did all of it — this is
+// the per-member view of the same work.
+//
+// Ranked on masks QA'd (pass + fail decisions), read from review_logs
+// rather than masks.reviewed_by: a redo upload clears reviewed_by, so
+// counting masks would strip a reviewer's credit for every mask they failed
+// that later got re-annotated. See fetchMemberProgress for the details.
+//
+// Visible to every member, not owner-gated: it is the same information the
+// Members page already shows, just ordered.
+function ReviewLeaderboard({ projectId }) {
+  const { showError } = useToast()
+  const [rows, setRows] = useState(null)
+
+  useEffect(() => {
+    let alive = true
+    fetchReviewLeaderboard(projectId)
+      .then((r) => alive && setRows(r))
+      .catch((e) => {
+        console.error('fetchReviewLeaderboard failed:', e)
+        if (alive) {
+          setRows([])
+          showError('Could not load the review leaderboard.')
+        }
+      })
+    return () => {
+      alive = false
+    }
+  }, [projectId, showError])
+
+  // Bars are scaled against the top scorer rather than the project total,
+  // so the ranking stays readable when everyone has reviewed a similar
+  // amount — against the total, four even members would all render as
+  // quarter-width stubs.
+  const top = rows?.reduce((n, r) => Math.max(n, r.qad), 0) ?? 0
+
+  return (
+    <div className="mt-6 rounded-xl border border-[#E5E4DF] p-4">
+      <p className="text-sm font-medium text-[#1a1a1a]">Review leaderboard</p>
+      <p className="mt-0.5 text-xs text-[#888780]">
+        Masks each member has QA&rsquo;d — passed plus failed.
+      </p>
+
+      {rows === null && <p className="mt-3 text-sm text-[#888780]">Loading…</p>}
+      {rows?.length === 0 && <p className="mt-3 text-sm text-[#888780]">No members yet.</p>}
+
+      {rows && rows.length > 0 && (
+        <ol className="mt-3 space-y-2.5">
+          {rows.map((r, i) => (
+            <li key={r.reviewer.id} className="flex items-center gap-3">
+              <span className="w-4 flex-shrink-0 text-xs tabular-nums text-[#B4B2A9]">{i + 1}</span>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="truncate text-sm">
+                    {r.reviewer.display_name || r.reviewer.email}
+                  </span>
+                  <span className="flex-shrink-0 text-sm font-medium tabular-nums">{r.qad}</span>
+                </div>
+                <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-[#F1EFE8]">
+                  <div
+                    className="h-full rounded-full bg-[#639922]"
+                    style={{ width: top > 0 ? `${(r.qad / top) * 100}%` : '0%' }}
+                  />
+                </div>
+                <p className="mt-1 text-xs text-[#888780]">
+                  <span className="text-[#27500A]">{r.passed} passed</span> ·{' '}
+                  <span className="text-[#791F1F]">{r.failed} failed</span> · {r.redone} redone ·{' '}
+                  {r.pending + r.redo} outstanding ·{' '}
+                  {r.lastActivityAt ? relativeTime(r.lastActivityAt) : 'no activity'}
+                </p>
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
     </div>
   )
 }
@@ -337,6 +458,7 @@ function ManagePhotos({ projectId, onChanged }) {
   const [thumbUrls, setThumbUrls] = useState({})
   const [selected, setSelected] = useState(new Set())
   const [busy, setBusy] = useState(false)
+  const [deleteProgress, setDeleteProgress] = useState(null) // null = hidden
 
   const load = useCallback(async () => {
     try {
@@ -381,11 +503,15 @@ function ManagePhotos({ projectId, onChanged }) {
     )
       return
     setBusy(true)
+    setDeleteProgress(0)
     try {
-      await deletePhotosWithStorage(projectId, chosen)
+      await deletePhotosWithStorage(projectId, chosen, {
+        onProgress: (done, total) => setDeleteProgress(total ? done / total : 1),
+      })
       setSelected(new Set())
       await load()
       onChanged?.()
+      setTimeout(() => setDeleteProgress(null), 400)
       showSuccess(`Deleted ${chosen.length} photo(s).`)
     } catch (e) {
       console.error('deletePhotosWithStorage failed:', e)
@@ -415,6 +541,11 @@ function ManagePhotos({ projectId, onChanged }) {
 
           {result && result.photos.length > 0 && (
             <>
+              {deleteProgress !== null && (
+                <div className="mb-2">
+                  <ProgressBar value={deleteProgress} tone="danger" />
+                </div>
+              )}
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-xs text-[#888780]">{selected.size} selected</span>
                 <button

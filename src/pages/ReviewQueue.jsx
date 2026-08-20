@@ -9,6 +9,7 @@ import {
   rebalanceAssignments,
 } from '../lib/projects'
 import { useToast } from '../components/Toast'
+import { selectAll } from '../lib/paging'
 
 // How many pending masks to hold in the local queue at once, and how close
 // to the end of it we get before quietly fetching more (so Next never has
@@ -140,17 +141,20 @@ export default function ReviewQueue() {
     // Categories stay project-wide: they drive the class-color picker,
     // which is per-project config rather than anyone's personal workload.
     // No categories table, so fetch the column and dedupe client-side.
-    const { data: catData, error: catError } = await supabase
-      .from('active_masks')
-      .select('category')
-      .eq('project_id', projectId)
-    
-    if (!catError && catData) {
+    // Paged: the distinct list is derived from every mask row, so a read
+    // truncated at 1000 drops whole classes out of the color picker.
+    try {
+      const catData = await selectAll(
+        () => supabase.from('active_masks').select('id, category').eq('project_id', projectId),
+        { orderBy: 'id' },
+      )
       const cats = new Set()
       for (const row of catData) {
         if (row.category) cats.add(row.category)
       }
       setCategories([...cats].sort())
+    } catch (e) {
+      console.error('category load failed:', e)
     }
   }, [projectId, userId])
 
@@ -211,7 +215,13 @@ export default function ReviewQueue() {
       // failed it. Leaving assigned_to set would make the reviewer the
       // permanent owner of every mask they rejected and bypass redo
       // distribution entirely.
-      const { error: updErr } = await supabase
+      // `.eq('status', 'pending')` makes this a no-op if someone else has
+      // already decided this mask. "Help others" mode deliberately serves
+      // work assigned to other people, so two reviewers landing on the same
+      // mask is a normal race, not an edge case — and without the guard the
+      // second decision silently overwrote the first, including flipping an
+      // already-actioned fail back out of someone's redo pile.
+      const { data: updated, error: updErr } = await supabase
         .from('masks')
         .update({
           status,
@@ -220,7 +230,21 @@ export default function ReviewQueue() {
           assigned_to: null,
         })
         .eq('id', mask.id)
+        .eq('status', 'pending')
+        .select('id')
       if (updErr) throw updErr
+
+      if (updated.length === 0) {
+        // Already decided by someone else. Drop it from the local queue so
+        // it stops being offered, but write no log row — we did not decide
+        // it, and claiming otherwise would corrupt the leaderboard.
+        const skipIndex = queueIndex
+        const withoutIt = [...queue.slice(0, skipIndex), ...queue.slice(skipIndex + 1)]
+        setQueue(withoutIt)
+        setQueueIndex(Math.min(skipIndex, Math.max(0, withoutIt.length - 1)))
+        showError('Someone else already reviewed that one — skipping it.')
+        return
+      }
       await supabase.from('review_logs').insert({
         project_id: projectId,
         mask_id: mask.id,
@@ -247,7 +271,14 @@ export default function ReviewQueue() {
         try {
           await rebalanceAssignments(projectId, 'fail')
         } catch (e) {
+          // Surfaced, not just logged: the decision is saved either way, but
+          // the mask is now sitting unassigned in nobody's My Redo while the
+          // dashboard still counts it. Silently swallowing that made the gap
+          // invisible until someone queried the database directly.
           console.error('rebalanceAssignments after fail failed:', e)
+          showError(
+            'Saved the fail, but could not hand it out for re-annotation — a lead can press “Distribute unassigned work” on the Members page.',
+          )
         }
       }
 
