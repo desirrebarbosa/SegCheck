@@ -75,18 +75,40 @@ export async function getMyMembership(projectId) {
   return data // null if not a member
 }
 
-// Just the roster. The per-member redo tally that used to live here has
-// moved to fetchMemberProgress(), which reports it alongside everything else
-// — keeping a second query for the same number only created a way for the
-// two to disagree. (It also read raw `masks`, so it counted assignments on
-// superseded photo versions and could show more redo than My Redo listed.)
+// Roster plus each member's outstanding redo count.
+//
+// `redo_count` was briefly removed here when fetchMemberProgress() took over
+// reporting it, but the Dashboard's per-assignee redo export depends on it to
+// label the assignee picker and size the batch — so it stays, and the two
+// agree because both now count the same way.
+//
+// Counted through `active_masks`, NOT raw `masks`: masks on superseded photo
+// versions keep their status and assignment but are invisible to every
+// screen, so counting them here showed a bigger redo number than My Redo
+// could actually list.
 export async function listMembers(projectId) {
   const { data, error } = await supabase
     .from('project_members')
     .select('is_lead, added_at, reviewer:reviewers(id, email, display_name)')
     .eq('project_id', projectId)
   if (error) throw error
-  return data
+
+  // One count-only query per member rather than tallying rows client-side:
+  // exact at any backlog size, and nothing crosses the wire but the numbers.
+  const counts = await Promise.all(
+    data.map(async (m) => {
+      const { count, error: cErr } = await supabase
+        .from('active_masks')
+        .select('id', { count: 'exact', head: true })
+        .eq('project_id', projectId)
+        .eq('status', 'fail')
+        .eq('assigned_to', m.reviewer.id)
+      if (cErr) throw cErr
+      return count ?? 0
+    }),
+  )
+
+  return data.map((m, i) => ({ ...m, redo_count: counts[i] }))
 }
 
 // Per-member numbers, for the Members page and the Dashboard leaderboard.
@@ -415,7 +437,8 @@ export async function fetchMyRedoAssignments(projectId, reviewerId) {
       supabase
         .from('active_masks')
         .select(
-          `id, category, bbox, storage_path,
+          `id, status, category, bbox, segmentation, storage_path, is_missing,
+       manifest_mask_id, assigned_to,
        photo_id, photo_filename, photo_storage_path, created_at`,
         )
         .eq('project_id', projectId)

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useOutletContext, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
-import { downloadBlob, getSignedUrl } from '../lib/storage'
-import { downloadZip } from '../lib/zipHelpers'
+import { getSignedUrl } from '../lib/storage'
+import { collectPhotoMaskEntries, downloadZip } from '../lib/zipHelpers'
+import { exportRedoBatch, exportOverallPercent, exportPhaseLabel } from '../lib/exportRedo'
+import { listMembers, fetchMyRedoAssignments, fetchReviewLeaderboard } from '../lib/projects'
 import { listPhotosForManagement, deletePhotosWithStorage, deleteProject } from '../lib/admin'
-import { fetchReviewLeaderboard } from '../lib/projects'
 import { selectAll } from '../lib/paging'
 import { relativeTime } from '../lib/relativeTime'
 import ProgressBar from '../components/ProgressBar'
@@ -13,45 +14,6 @@ import { useToast } from '../components/Toast'
 // Count-only queries (head: true) instead of fetching every active_masks
 // row just to tally them — cheap regardless of project size. Full rows are
 // only fetched on demand, when the person actually clicks export.
-function csvField(value) {
-  const s = String(value ?? '')
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
-}
-
-// One row per category: how many were never produced by the SAM-assisted
-// pipeline at all (is_missing) vs how many a reviewer actually looked at
-// and rejected — the annotator needs to know which is which, since a
-// missing mask means "do this object", not "redo it".
-function buildRedoInstructionsCsv(failedRows) {
-  const byCategory = new Map()
-  for (const r of failedRows) {
-    const cat = r.category ?? '(uncategorized)'
-    const entry = byCategory.get(cat) ?? { missing: 0, rejected: 0 }
-    if (r.is_missing) entry.missing += 1
-    else entry.rejected += 1
-    byCategory.set(cat, entry)
-  }
-
-  const totalMissing = failedRows.filter((r) => r.is_missing).length
-  const totalRejected = failedRows.length - totalMissing
-
-  const lines = [
-    csvField('This zip contains photos and masks that failed QA review and need re-annotation.'),
-    csvField('missing_count = no mask was ever produced for this object (do it from scratch).'),
-    csvField('rejected_count = a mask existed but a reviewer rejected it (redo/fix it).'),
-    '',
-    ['category', 'missing_count', 'rejected_count', 'total'].map(csvField).join(','),
-    ...[...byCategory.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([cat, { missing, rejected }]) =>
-        [cat, missing, rejected, missing + rejected].map(csvField).join(','),
-      ),
-    ['TOTAL', totalMissing, totalRejected, failedRows.length].map(csvField).join(','),
-  ]
-
-  return new Blob([lines.join('\n')], { type: 'text/csv' })
-}
-
 async function fetchStatusCounts(projectId) {
   const statuses = ['pending', 'pass', 'fail']
   const counts = {}
@@ -79,7 +41,8 @@ async function fetchAllActiveMasks(projectId) {
       supabase
         .from('active_masks')
         .select(
-          `id, status, is_missing, category, storage_path,
+          `id, status, is_missing, category, storage_path, bbox, segmentation,
+       manifest_mask_id, assigned_to,
        photo_id, photo_filename, photo_storage_path`,
         )
         .eq('project_id', projectId),
@@ -135,7 +98,10 @@ export default function Dashboard() {
   const navigate = useNavigate()
   const [counts, setCounts] = useState(null)
   const [busy, setBusy] = useState(false)
-  const [zipProgress, setZipProgress] = useState(null) // null = hidden
+  const [members, setMembers] = useState([]) // [{ reviewer: {id, email, display_name}, redo_count }]
+  const [assigneeId, setAssigneeId] = useState('') // '' = everyone
+  const [redoProgress, setRedoProgress] = useState(null) // { phase, done, total }
+  const [redoController, setRedoController] = useState(null) // AbortController for the in-flight download
 
   const loadCounts = useCallback(async () => {
     try {
@@ -149,6 +115,12 @@ export default function Dashboard() {
   useEffect(() => {
     loadCounts()
   }, [loadCounts])
+
+  useEffect(() => {
+    listMembers(projectId)
+      .then(setMembers)
+      .catch((e) => console.error('listMembers failed:', e))
+  }, [projectId])
 
   async function exportCsv() {
     setBusy(true)
@@ -173,43 +145,45 @@ export default function Dashboard() {
     }
   }
 
+  const selectedMember = members.find((m) => m.reviewer.id === assigneeId)
+  const redoCountInScope = selectedMember ? selectedMember.redo_count : (counts?.fail ?? 0)
+
   async function exportRedoZip() {
+    const controller = new AbortController()
+    setRedoController(controller)
     setBusy(true)
-    setZipProgress(0)
+    setRedoProgress(null)
     try {
-      const rows = await fetchAllActiveMasks(projectId)
-      const failed = rows.filter((r) => r.status === 'fail')
-      const files = []
-      const seenPhotos = new Set()
-      // Reported per ROW rather than per file: a row is one mask and, the
-      // first time its photo appears, one photo download too. Counting
-      // files would make progress lurch depending on how many masks
-      // happen to share a photo.
-      let done = 0
-      for (const r of failed) {
-        if (!seenPhotos.has(r.photo_id)) {
-          seenPhotos.add(r.photo_id)
-          const photoBlob = await downloadBlob(r.photo_storage_path)
-          files.push({ path: `photos/${r.photo_filename}`, blob: photoBlob })
-        }
-        if (r.storage_path) {
-          const maskBlob = await downloadBlob(r.storage_path)
-          const maskName = r.storage_path.split('/').pop()
-          files.push({ path: `masks/${r.photo_filename}/${maskName}`, blob: maskBlob })
-        }
-        done += 1
-        setZipProgress(done / failed.length)
-      }
-      files.push({ path: 'instructions.csv', blob: buildRedoInstructionsCsv(failed) })
-      await downloadZip(`${project?.name ?? 'segcheck'}-redo.zip`, files)
+      // Scoping to one assignee uses the same per-reviewer query MyRedo.jsx
+      // uses for its own self-export, so an owner exporting on someone's
+      // behalf gets exactly the batch that person would get themselves.
+      const rows = assigneeId
+        ? await fetchMyRedoAssignments(projectId, assigneeId)
+        : await fetchAllActiveMasks(projectId)
+      const membersById = new Map(members.map((m) => [m.reviewer.id, m.reviewer]))
+      const filenamePrefix = selectedMember
+        ? (selectedMember.reviewer.display_name || selectedMember.reviewer.email)
+        : (project?.name ?? 'segcheck')
+      await exportRedoBatch({
+        rows,
+        filenamePrefix,
+        membersById,
+        onProgress: setRedoProgress,
+        signal: controller.signal,
+      })
       showSuccess('Redo batch downloaded.')
       setTimeout(() => setZipProgress(null), 400)
     } catch (e) {
-      console.error('exportRedoZip failed:', e)
-      showError('Could not build the redo batch.')
-      // Left frozen where it stopped — that's where it actually failed.
+      if (controller.signal.aborted) {
+        showSuccess('Redo batch download cancelled.')
+      } else {
+        console.error('exportRedoZip failed:', e)
+        showError('Could not build the redo batch.')
+      }
     } finally {
       setBusy(false)
+      setRedoProgress(null)
+      setRedoController(null)
     }
   }
 
@@ -234,20 +208,36 @@ export default function Dashboard() {
           <i className="ti ti-download text-base" aria-hidden="true"></i>
           Export CSV
         </button>
+        <select
+          value={assigneeId}
+          onChange={(e) => setAssigneeId(e.target.value)}
+          disabled={busy}
+          aria-label="Scope redo batch to"
+          className="rounded-lg border border-[#B4B2A9] px-2.5 py-2 text-sm disabled:opacity-50"
+        >
+          <option value="">Everyone ({counts?.fail ?? 0})</option>
+          {members.map((m) => (
+            <option key={m.reviewer.id} value={m.reviewer.id}>
+              {m.reviewer.display_name || m.reviewer.email} ({m.redo_count})
+            </option>
+          ))}
+        </select>
         <button
           onClick={exportRedoZip}
-          disabled={busy || !counts?.fail}
+          disabled={busy || !redoCountInScope}
           className="flex items-center gap-1.5 rounded-lg bg-[#D85A30] px-3.5 py-2 text-sm font-medium text-white disabled:opacity-50"
         >
           <i className="ti ti-package text-base" aria-hidden="true"></i>
-          {busy ? 'Working…' : `Download redo batch (${counts?.fail ?? 0})`}
+          {busy ? 'Working…' : `Download redo batch (${redoCountInScope})`}
         </button>
       </div>
 
-      {zipProgress !== null && (
-        <div className="mt-3 max-w-sm">
-          <ProgressBar value={zipProgress} tone="danger" />
-        </div>
+      {redoProgress && (
+        <ProgressBar
+          percent={exportOverallPercent(redoProgress)}
+          label={`${exportPhaseLabel(redoProgress)}…`}
+          onCancel={() => redoController?.abort()}
+        />
       )}
 
       <ReviewLeaderboard projectId={projectId} />
@@ -374,6 +364,8 @@ function AnnotatedExport({ projectId, projectName }) {
   const { showError, showSuccess } = useToast()
   const [splitCounts, setSplitCounts] = useState(null) // Map<split, count>
   const [downloadingSplit, setDownloadingSplit] = useState(null)
+  const [progress, setProgress] = useState(null) // { percent, label }
+  const [controller, setController] = useState(null) // AbortController for the in-flight download
 
   const load = useCallback(async () => {
     try {
@@ -389,31 +381,47 @@ function AnnotatedExport({ projectId, projectName }) {
   }, [load])
 
   async function handleDownload(split) {
+    const abortController = new AbortController()
+    setController(abortController)
     setDownloadingSplit(split)
+    setProgress(null)
     try {
       const rows = await fetchPassedForSplit(projectId, split)
-      const files = []
-      const seenPhotos = new Set()
-      for (const r of rows) {
-        if (!seenPhotos.has(r.photo_id)) {
-          seenPhotos.add(r.photo_id)
-          const photoBlob = await downloadBlob(r.photo_storage_path)
-          files.push({ path: `photos/${r.photo_filename}`, blob: photoBlob })
-        }
-        if (r.storage_path) {
-          const maskBlob = await downloadBlob(r.storage_path)
-          const maskName = r.storage_path.split('/').pop()
-          files.push({ path: `masks/${r.photo_filename}/${maskName}`, blob: maskBlob })
-        }
-      }
+      // Two phases, weighted: fetching every photo/mask from Storage is
+      // the slow part for any real batch, compressing what's already
+      // in memory is comparatively quick.
+      const { files } = await collectPhotoMaskEntries(
+        rows,
+        {},
+        (done, total) => {
+          setProgress({
+            percent: (done / total) * 70,
+            label: `Downloading photos & masks (${done}/${total})\u2026`,
+          })
+        },
+        abortController.signal,
+      )
       const label = split === '(no split)' ? 'default' : split
-      await downloadZip(`${projectName ?? 'segcheck'}-${label}-annotated.zip`, files)
+      await downloadZip(
+        `${projectName ?? 'segcheck'}-${label}-annotated.zip`,
+        files,
+        (percent) => {
+          setProgress({ percent: 70 + percent * 0.3, label: 'Compressing zip\u2026' })
+        },
+        abortController.signal,
+      )
       showSuccess(`Downloaded ${label}.`)
     } catch (e) {
-      console.error('AnnotatedExport download failed:', e)
-      showError('Could not build that split\u2019s zip.')
+      if (abortController.signal.aborted) {
+        showSuccess('Download cancelled.')
+      } else {
+        console.error('AnnotatedExport download failed:', e)
+        showError('Could not build that split\u2019s zip.')
+      }
     } finally {
       setDownloadingSplit(null)
+      setProgress(null)
+      setController(null)
     }
   }
 
@@ -442,6 +450,13 @@ function AnnotatedExport({ projectId, projectName }) {
             </button>
           ))}
       </div>
+      {progress && (
+        <ProgressBar
+          percent={progress.percent}
+          label={progress.label}
+          onCancel={() => controller?.abort()}
+        />
+      )}
     </div>
   )
 }
@@ -543,7 +558,7 @@ function ManagePhotos({ projectId, onChanged }) {
             <>
               {deleteProgress !== null && (
                 <div className="mb-2">
-                  <ProgressBar value={deleteProgress} tone="danger" />
+                  <ProgressBar percent={deleteProgress * 100} label="Deleting" />
                 </div>
               )}
               <div className="mb-2 flex items-center justify-between">

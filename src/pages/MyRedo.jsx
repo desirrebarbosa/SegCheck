@@ -4,16 +4,18 @@ import { supabase } from '../lib/supabaseClient'
 import { fetchMyRedoAssignments } from '../lib/projects'
 import { getSignedUrl } from '../lib/storage'
 import { fetchGuide, isGuideApiConfigured } from '../lib/apiHelper'
+import { exportRedoBatch, exportOverallPercent, exportPhaseLabel } from '../lib/exportRedo'
 import { useToast } from '../components/Toast'
-
-// 3x3 on the widest layout, so a page is always a full grid.
-const PAGE_SIZE = 9
+import ProgressBar from '../components/ProgressBar'
 
 export default function MyRedo() {
-  const { projectId } = useOutletContext()
-  const { showError } = useToast()
+  const { projectId, project } = useOutletContext()
+  const { showError, showSuccess } = useToast()
   const [items, setItems] = useState(null) // null = loading
-  const [page, setPage] = useState(0)
+  const [me, setMe] = useState(null) // { id, email }
+  const [downloading, setDownloading] = useState(false)
+  const [progress, setProgress] = useState(null) // { phase, done, total }
+  const [controller, setController] = useState(null) // AbortController for the in-flight download
 
   useEffect(() => {
     let alive = true
@@ -21,12 +23,10 @@ export default function MyRedo() {
       const {
         data: { user },
       } = await supabase.auth.getUser()
+      if (alive) setMe(user ? { id: user.id, email: user.email } : null)
       try {
         const rows = await fetchMyRedoAssignments(projectId, user.id)
-        if (alive) {
-          setItems(rows)
-          setPage(0)
-        }
+        if (alive) setItems(rows)
       } catch (e) {
         console.error('fetchMyRedoAssignments failed:', e)
         if (alive) {
@@ -41,21 +41,61 @@ export default function MyRedo() {
     }
   }, [projectId, showError])
 
-  // Paged client-side: fetchMyRedoAssignments already returns the whole
-  // (per-reviewer, so bounded) list in one query, and slicing it here keeps
-  // page changes instant with no refetch. Worth revisiting only if one
-  // person's share ever grows past a few hundred.
-  const pageCount = items ? Math.ceil(items.length / PAGE_SIZE) : 0
-  const pageItems = items ? items.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE) : []
-  const rangeStart = items?.length ? page * PAGE_SIZE + 1 : 0
-  const rangeEnd = Math.min((page + 1) * PAGE_SIZE, items?.length ?? 0)
+  async function handleDownload() {
+    const abortController = new AbortController()
+    setController(abortController)
+    setDownloading(true)
+    setProgress(null)
+    try {
+      const membersById = me ? new Map([[me.id, { email: me.email }]]) : undefined
+      await exportRedoBatch({
+        rows: items,
+        filenamePrefix: `${project?.name ?? 'my'}-redo`,
+        membersById,
+        onProgress: setProgress,
+        signal: abortController.signal,
+      })
+      showSuccess('Redo batch downloaded.')
+    } catch (e) {
+      if (abortController.signal.aborted) {
+        showSuccess('Redo batch download cancelled.')
+      } else {
+        console.error('exportRedoBatch failed:', e)
+        showError('Could not build your redo batch.')
+      }
+    } finally {
+      setDownloading(false)
+      setProgress(null)
+      setController(null)
+    }
+  }
 
   return (
     <section>
-      <h2 className="text-lg font-medium">My Redo</h2>
-      <p className="mt-1 text-sm text-[#888780]">
-        Failed Masks from QA Review, manually annotate them and upload again.
-      </p>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h2 className="text-lg font-medium">My Redo</h2>
+          <p className="mt-1 text-sm text-[#888780]">
+            Failed Masks from QA Review, manually annotate them and upload again.
+          </p>
+        </div>
+        <button
+          onClick={handleDownload}
+          disabled={downloading || !items?.length}
+          className="flex items-center gap-1.5 rounded-lg bg-[#D85A30] px-3.5 py-2 text-sm font-medium text-white disabled:opacity-50"
+        >
+          <i className="ti ti-package text-base" aria-hidden="true"></i>
+          {downloading ? 'Working…' : `Download my redo batch (${items?.length ?? 0})`}
+        </button>
+      </div>
+
+      {progress && (
+        <ProgressBar
+          percent={exportOverallPercent(progress)}
+          label={`${exportPhaseLabel(progress)}…`}
+          onCancel={() => controller?.abort()}
+        />
+      )}
 
       {!isGuideApiConfigured() && (
         <p className="mt-3 rounded-lg bg-[#F1EFE8] px-3 py-2 text-xs text-[#5F5E5A]">
@@ -68,65 +108,12 @@ export default function MyRedo() {
         <p className="mt-6 text-sm text-[#888780]">Nothing assigned to you right now.</p>
       )}
 
-      {items?.length > 0 && (
-        <>
-          <p className="mt-4 text-xs text-[#888780]">
-            Showing {rangeStart}–{rangeEnd} of {items.length}
-          </p>
-
-          <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {pageItems.map((item) => (
-              <RedoItemCard key={item.id} item={item} />
-            ))}
-          </div>
-
-          {pageCount > 1 && (
-            <div className="mt-5 flex items-center justify-center gap-1">
-              <PageButton
-                onClick={() => setPage((p) => p - 1)}
-                disabled={page === 0}
-                label="Previous page"
-                icon="ti-chevron-left"
-              />
-              {Array.from({ length: pageCount }, (_, i) => (
-                <button
-                  key={i}
-                  onClick={() => setPage(i)}
-                  aria-label={`Page ${i + 1}`}
-                  aria-current={i === page ? 'page' : undefined}
-                  className={
-                    i === page
-                      ? 'h-8 min-w-8 rounded-lg bg-[#1a1a1a] px-2 text-xs font-medium text-white'
-                      : 'h-8 min-w-8 rounded-lg border border-[#E5E4DF] px-2 text-xs hover:bg-[#F7F7F5]'
-                  }
-                >
-                  {i + 1}
-                </button>
-              ))}
-              <PageButton
-                onClick={() => setPage((p) => p + 1)}
-                disabled={page >= pageCount - 1}
-                label="Next page"
-                icon="ti-chevron-right"
-              />
-            </div>
-          )}
-        </>
-      )}
+      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {items?.map((item) => (
+          <RedoItemCard key={item.id} item={item} />
+        ))}
+      </div>
     </section>
-  )
-}
-
-function PageButton({ onClick, disabled, label, icon }) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      aria-label={label}
-      className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#E5E4DF] text-[#5F5E5A] hover:bg-[#F7F7F5] disabled:cursor-not-allowed disabled:opacity-30"
-    >
-      <i className={`ti ${icon} text-base`} aria-hidden="true"></i>
-    </button>
   )
 }
 

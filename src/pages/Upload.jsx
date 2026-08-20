@@ -188,7 +188,9 @@ export default function Upload() {
             >
               {busy ? 'Uploading…' : `Confirm & upload "${planResult.split}"`}
             </button>
-            {progress !== null && <ProgressBar value={progress} tone="success" />}
+            {progress !== null && (
+              <ProgressBar percent={progress * 100} label="Uploading" />
+            )}
           </div>
         </div>
       )}
@@ -359,7 +361,9 @@ function RedoUpload({ projectId }) {
             >
               {busy ? 'Uploading…' : `Confirm & upload ${plan.matched.length} mask(s)`}
             </button>
-            {progress !== null && <ProgressBar value={progress} tone="success" />}
+            {progress !== null && (
+              <ProgressBar percent={progress * 100} label="Uploading" />
+            )}
           </div>
         </div>
       )}

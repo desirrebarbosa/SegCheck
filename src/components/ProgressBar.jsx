@@ -1,31 +1,36 @@
-// A filling bar with no numeric label, driven by real work completed.
+// A small determinate progress bar for long-running client-side exports
+// (fetching photos/masks from Storage, rendering instance previews,
+// compressing the zip) — so a multi-second wait shows real movement
+// instead of a static "Working…" label that reads as a hang.
 //
-// No "3 of 12" and no percentage text, deliberately: the underlying work
-// finishes in bounded-concurrent batches, so counts arrive in clusters and
-// a visible number would jitter in a way a bar simply doesn't.
-//
-// The width transition exists for the same reason — a batch of ~6 photos
-// completing together would otherwise look like the bar stalls and then
-// jumps. Easing across the gap reads as steady progress.
-//
-// `value` is a fraction from 0 to 1 and is clamped, so callers can pass
-// done/total without guarding against total === 0.
-export default function ProgressBar({ value = 0, tone = 'dark' }) {
-  const pct = Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0)) * 100
-  const fill = tone === 'danger' ? 'bg-[#791F1F]' : tone === 'success' ? 'bg-[#639922]' : 'bg-[#1a1a1a]'
-
+// `onCancel`, if given, renders a Cancel affordance next to the label —
+// opt-in so callers that can't actually cancel (or don't wire it up yet)
+// don't show a button that does nothing.
+export default function ProgressBar({ percent, label, onCancel }) {
+  const clamped = Math.min(100, Math.max(0, percent))
   return (
-    <div
-      role="progressbar"
-      aria-valuemin={0}
-      aria-valuemax={100}
-      aria-valuenow={Math.round(pct)}
-      className="h-1.5 w-full overflow-hidden rounded-full bg-[#E5E4DF]"
-    >
-      <div
-        className={`h-full rounded-full transition-[width] duration-300 ease-out ${fill}`}
-        style={{ width: `${pct}%` }}
-      />
+    <div className="mt-2 w-full max-w-sm">
+      <div className="flex items-center justify-between text-xs text-[#888780]">
+        <span>{label}</span>
+        <span className="flex items-center gap-2">
+          {Math.round(clamped)}%
+          {onCancel && (
+            <button
+              onClick={onCancel}
+              className="font-medium text-[#993C1D] hover:underline"
+              type="button"
+            >
+              Cancel
+            </button>
+          )}
+        </span>
+      </div>
+      <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-[#F1EFE8]">
+        <div
+          className="h-full rounded-full bg-[#D85A30] transition-[width] duration-150"
+          style={{ width: `${clamped}%` }}
+        />
+      </div>
     </div>
   )
 }

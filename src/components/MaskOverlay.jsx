@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getSignedUrl } from '../lib/storage'
-import { decodeCocoRLE, isRLE } from '../lib/rle'
+import { drawInstanceLayers, loadImage } from '../lib/instanceRender'
 
 const MAX_HEIGHT_VH = 0.65 // container never taller than 65% of viewport height
 const MAX_ZOOM = 4 // multiplier ON TOP of fit — i.e. 4x more zoomed in than fit
@@ -77,16 +77,6 @@ export default function MaskOverlay({
   const baseWidth = naturalSize ? naturalSize.width * fitScale : 0
   const baseHeight = naturalSize ? naturalSize.height * fitScale : 0
 
-  const rle = useMemo(() => {
-    if (!segmentation || !isRLE(segmentation)) return null
-    try {
-      return decodeCocoRLE(segmentation)
-    } catch (e) {
-      console.error('RLE decode failed:', e)
-      return null
-    }
-  }, [segmentation])
-
   useEffect(() => {
     let alive = true
 
@@ -133,63 +123,16 @@ export default function MaskOverlay({
         const ctx = canvas.getContext('2d')
         canvas.width = photo.naturalWidth
         canvas.height = photo.naturalHeight
-        ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-        ctx.globalAlpha = opacities.photo
-        ctx.drawImage(photo, 0, 0)
-        ctx.globalAlpha = 1
-
-        if (mask) {
-          ctx.globalAlpha = opacities.mask
-          ctx.drawImage(mask, 0, 0, canvas.width, canvas.height)
-          ctx.globalAlpha = 1
-        }
-
-        if (rle) {
-          const off = document.createElement('canvas')
-          off.width = rle.width
-          off.height = rle.height
-          const octx = off.getContext('2d')
-          const imgData = octx.createImageData(rle.width, rle.height)
-          const [r, g, b] = hexToRgb(polygonColor)
-          for (let i = 0; i < rle.data.length; i++) {
-            if (rle.data[i]) {
-              imgData.data[i * 4] = r
-              imgData.data[i * 4 + 1] = g
-              imgData.data[i * 4 + 2] = b
-              imgData.data[i * 4 + 3] = 255
-            }
-          }
-          octx.putImageData(imgData, 0, 0)
-          ctx.globalAlpha = opacities.polygon
-          ctx.drawImage(off, 0, 0, canvas.width, canvas.height)
-          ctx.globalAlpha = 1
-        } else if (Array.isArray(segmentation)) {
-          ctx.globalAlpha = opacities.polygon
-          ctx.fillStyle = polygonColor
-          ctx.strokeStyle = polygonColor
-          ctx.lineWidth = 2
-          for (const poly of segmentation) {
-            ctx.beginPath()
-            for (let i = 0; i < poly.length; i += 2) {
-              if (i === 0) ctx.moveTo(poly[i], poly[i + 1])
-              else ctx.lineTo(poly[i], poly[i + 1])
-            }
-            ctx.closePath()
-            ctx.fill()
-            ctx.stroke()
-          }
-          ctx.globalAlpha = 1
-        }
-
-        if (bbox) {
-          const [x, y, w, h] = bbox
-          ctx.globalAlpha = opacities.bbox
-          ctx.strokeStyle = bboxColor
-          ctx.lineWidth = 2
-          ctx.strokeRect(x, y, w, h)
-          ctx.globalAlpha = 1
-        }
+        drawInstanceLayers(ctx, {
+          photoImg: photo,
+          maskImg: mask,
+          bbox,
+          segmentation,
+          opacities,
+          bboxColor,
+          polygonColor,
+        })
       } catch (e) {
         if (alive) setError(e.message)
       }
@@ -204,7 +147,6 @@ export default function MaskOverlay({
     photoPath,
     maskPath,
     bbox,
-    rle,
     segmentation,
     opacities,
     bboxColor,
@@ -399,25 +341,4 @@ export default function MaskOverlay({
       </div>
     </div>
   )
-}
-
-function loadImage(src) {
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.crossOrigin = 'anonymous'
-    img.onload = () => resolve(img)
-    // `onerror` hands back a DOM Event, which has no `.message` — passing
-    // it straight to reject meant the UI rendered an empty error box and
-    // told you nothing. The browser deliberately withholds the real cause
-    // here (it's the same opaque event for a 404, a CORS rejection, and a
-    // corrupt file), so name the realistic candidates instead.
-    img.onerror = () =>
-      reject(new Error('the file is missing, blocked by CORS, or not a valid image.'))
-    img.src = src
-  })
-}
-
-function hexToRgb(hex) {
-  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex)
-  return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [29, 158, 117]
 }
