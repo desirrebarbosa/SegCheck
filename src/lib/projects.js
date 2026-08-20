@@ -132,7 +132,12 @@ export async function listMembers(projectId) {
 // same shape as the load counts in rebalanceAssignments. Cost is one small
 // request per member per metric, which is fine for a project roster; if a
 // roster ever grows past a few dozen people this wants a SQL view instead.
-export async function fetchMemberProgress(projectId, reviewerIds) {
+// `includeCompleted: false` skips the review_logs half entirely, returning
+// only the outstanding-load numbers. That is four fewer requests per member
+// — worth it for the Members page, which shows only `pending` and `redo`.
+// The completed fields come back undefined in that mode, so any caller that
+// renders them must leave the flag alone (see components/MemberProgressFull).
+export async function fetchMemberProgress(projectId, reviewerIds, { includeCompleted = true } = {}) {
   const countMasks = async (reviewerId, status) => {
     const { count, error } = await supabase
       .from('active_masks')
@@ -179,9 +184,13 @@ export async function fetchMemberProgress(projectId, reviewerIds) {
 
   const entries = await Promise.all(
     reviewerIds.map(async (id) => {
-      const [pending, redo, passed, failed, redone, lastActivityAt] = await Promise.all([
+      const [pending, redo] = await Promise.all([
         countMasks(id, 'pending'),
         countMasks(id, 'fail'),
+      ])
+      if (!includeCompleted) return [id, { pending, redo }]
+
+      const [passed, failed, redone, lastActivityAt] = await Promise.all([
         countLogs(id, 'confirm_pass'),
         countLogs(id, 'confirm_fail'),
         countLogs(id, 'redo_upload'),

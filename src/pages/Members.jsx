@@ -9,7 +9,6 @@ import {
 } from '../lib/projects'
 import { relevelRedo, fetchOpenBatches } from '../lib/redoBatches'
 import { useToast } from '../components/Toast'
-import { relativeTime } from '../lib/relativeTime'
 
 export default function Members() {
   const { projectId, project, isOwner } = useOutletContext()
@@ -36,9 +35,12 @@ export default function Members() {
     }
     try {
       const [prog, batches] = await Promise.all([
+        // includeCompleted: false skips the review_logs half — four queries
+        // per member that only fed the numbers this page no longer shows.
         fetchMemberProgress(
           projectId,
           roster.map((m) => m.reviewer.id),
+          { includeCompleted: false },
         ),
         fetchOpenBatches(projectId),
       ])
@@ -97,26 +99,29 @@ export default function Members() {
   // Distinct from "Distribute unassigned work", which only ever hands out
   // masks nobody holds and so can never correct an imbalance that already
   // exists. This RELEASES first — but only work nobody has downloaded, so a
-  // batch someone is mid-way through is untouchable.
+  // batch someone is mid-way through is untouchable. Its owner still takes
+  // part in the deal: the batch protects those masks, not their place in the
+  // queue, so they are topped up to the same total as everyone else.
   async function handleRelevel() {
     if (
       !confirm(
         'Re-level the redo backlog?\n\n' +
-          'Work that has been downloaded is left alone. Everything else is ' +
-          'released and split evenly among the members who have nothing open.',
+          'Work that has been downloaded stays with whoever has it. Everything ' +
+          'else is released and re-split so every member ends up with the same ' +
+          'total — including anyone mid-batch, who is topped up to match.',
       )
     )
       return
     setBusy(true)
     try {
-      const { released, dealt, eligible, busy: heldBack } = await relevelRedo(projectId)
+      const { released, dealt, participants, busy: midBatch } = await relevelRedo(projectId)
       await refresh()
-      if (eligible === 0) {
-        showError('Everyone has a downloaded batch open — nothing can be re-levelled yet.')
+      if (dealt === 0) {
+        showError('Nothing to re-level — every remaining mask is inside a downloaded batch.')
       } else {
         showSuccess(
-          `Re-levelled: ${released} released, ${dealt} split across ${eligible} member(s).` +
-            (heldBack > 0 ? ` ${heldBack} left alone with work in progress.` : ''),
+          `Re-levelled: ${released} released, ${dealt} split across ${participants} member(s).` +
+            (midBatch > 0 ? ` ${midBatch} mid-batch, topped up to match.` : ''),
         )
       }
     } catch (e) {
@@ -205,7 +210,7 @@ export default function Members() {
                 <p className="mt-1 inline-flex items-center gap-1.5 rounded-lg bg-[#FDF3E7] px-2 py-0.5 text-xs text-[#7A4A12]">
                   <i className="ti ti-lock text-xs" aria-hidden="true"></i>
                   Batch {openBatches[m.reviewer.id].batchNumber} downloaded —{' '}
-                  {openBatches[m.reviewer.id].outstanding} left, protected from re-levelling
+                  {openBatches[m.reviewer.id].outstanding} left, protected
                 </p>
               )}
             </div>
@@ -243,6 +248,12 @@ export default function Members() {
 // Zeroes are rendered rather than hidden: a member with 0 outstanding and
 // 0 done needs to look different from one who has cleared their queue, and
 // the old "hide when zero" badge made those two identical.
+// Outstanding work only — what this member still has on their plate.
+//
+// The completed-work half (reviewed / passed / failed / redone / last
+// active) is parked in components/MemberProgressFull.jsx, along with the
+// note on how to put it back. Zeroes are still rendered rather than hidden:
+// "cleared their queue" and "never had one" need to look different.
 function MemberProgress({ p, loading }) {
   if (loading) return <p className="mt-1 text-xs text-[#B4B2A9]">Loading progress…</p>
   if (!p) return null
@@ -250,16 +261,6 @@ function MemberProgress({ p, loading }) {
     <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
       <Metric value={p.pending} label="to review" />
       <Metric value={p.redo} label="to redo" tone="danger" />
-      <span className="text-[#D8D6CE]" aria-hidden="true">
-        |
-      </span>
-      <Metric value={p.qad} label="reviewed" tone="strong" />
-      <Metric value={p.passed} label="passed" tone="success" />
-      <Metric value={p.failed} label="failed" />
-      <Metric value={p.redone} label="redone" />
-      <span className="text-[#888780]">
-        {p.lastActivityAt ? `active ${relativeTime(p.lastActivityAt)}` : 'no activity yet'}
-      </span>
     </div>
   )
 }

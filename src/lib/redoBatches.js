@@ -91,9 +91,11 @@ export async function closeCompletedBatches(projectId, reviewerId) {
   return closed
 }
 
-// Members with nothing downloaded and outstanding — the only people a
-// re-level is allowed to hand new work to. Someone mid-batch is left alone
-// until they submit, rather than having more piled on top.
+// Who currently holds a downloaded batch. Reported so the UI can say who is
+// mid-batch — NOT used to exclude anyone from a re-level. Holding an open
+// batch protects the masks inside it; it does not take you out of the deal
+// for everything else, or someone who downloaded early would fall further
+// and further behind the people who did not.
 export async function fetchEligibleMembers(projectId) {
   const [{ data: members, error: mErr }, { data: openBatches, error: bErr }] = await Promise.all([
     supabase.from('project_members').select('reviewer_id').eq('project_id', projectId),
@@ -120,13 +122,23 @@ export async function fetchEligibleMembers(projectId) {
 // it can release is exactly what nobody has downloaded: anything inside an
 // open batch is excluded by construction.
 //
+// Everyone takes part in the deal, including people mid-batch. What an open
+// batch protects is the masks inside it, not its owner's place in the queue —
+// they are simply topped up to the same TOTAL as everyone else.
+//
 // Owner-triggered rather than automatic. Moving work between people is a
 // decision, not a background chore.
 export async function relevelRedo(projectId) {
-  const { eligible, busy } = await fetchEligibleMembers(projectId)
-  if (eligible.length === 0) {
-    return { released: 0, dealt: 0, perMember: {}, eligible: 0, busy: busy.length }
+  const { data: members, error: mErr } = await supabase
+    .from('project_members')
+    .select('reviewer_id')
+    .eq('project_id', projectId)
+  if (mErr) throw mErr
+  if (members.length === 0) {
+    return { released: 0, dealt: 0, perMember: {}, participants: 0, busy: 0 }
   }
+  const participants = members.map((m) => m.reviewer_id)
+  const { busy } = await fetchEligibleMembers(projectId)
 
   // Release: unbatched fail work only. An open batch is somebody's downloaded
   // zip, in progress on their machine.
@@ -152,10 +164,11 @@ export async function relevelRedo(projectId) {
     if (error) throw error
   }
 
-  // Deal the whole free pool across eligible members. Their current load is
-  // whatever survived in an open batch — zero for anyone being re-dealt — so
-  // seeding it keeps distributeEvenly levelling TOTALS rather than just
-  // splitting this pool.
+  // Deal the whole free pool across EVERY member, including anyone holding an
+  // open batch. Their surviving load is exactly what is locked in that batch,
+  // and seeding it means distributeEvenly levels TOTALS: someone already
+  // holding 969 is topped up to the same total as everyone else rather than
+  // being handed a full share on top, or skipped entirely.
   const pool = await selectAll(
     () =>
       supabase
@@ -168,9 +181,9 @@ export async function relevelRedo(projectId) {
     { orderBy: 'id' },
   )
 
-  const load = new Map(eligible.map((id) => [id, 0]))
+  const load = new Map(participants.map((id) => [id, 0]))
   await Promise.all(
-    eligible.map(async (id) => {
+    participants.map(async (id) => {
       const { count, error } = await supabase
         .from('masks')
         .select('id', { count: 'exact', head: true })
@@ -203,7 +216,7 @@ export async function relevelRedo(projectId) {
     released: held.length,
     dealt: pool.length,
     perMember,
-    eligible: eligible.length,
+    participants: participants.length,
     busy: busy.length,
   }
 }

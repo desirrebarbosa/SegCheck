@@ -4,10 +4,9 @@ import { supabase } from '../lib/supabaseClient'
 import { getSignedUrl } from '../lib/storage'
 import { collectPhotoMaskEntries, downloadZip } from '../lib/zipHelpers'
 import { exportRedoBatch, exportOverallPercent, exportPhaseLabel } from '../lib/exportRedo'
-import { listMembers, fetchMyRedoAssignments, fetchReviewLeaderboard } from '../lib/projects'
+import { listMembers, fetchMyRedoAssignments } from '../lib/projects'
 import { listPhotosForManagement, deletePhotosWithStorage, deleteProject } from '../lib/admin'
 import { selectAll } from '../lib/paging'
-import { relativeTime } from '../lib/relativeTime'
 import ProgressBar from '../components/ProgressBar'
 import { useToast } from '../components/Toast'
 
@@ -246,8 +245,6 @@ export default function Dashboard() {
         />
       )}
 
-      <ReviewLeaderboard projectId={projectId} />
-
       <AnnotatedExport projectId={projectId} projectName={project?.name} />
 
       {isOwner && (
@@ -275,86 +272,6 @@ function Stat({ label, value, tone }) {
     <div className={`rounded-xl px-3 py-2.5 ${styles}`}>
       <p className="text-xl font-medium">{value ?? '…'}</p>
       <p className="text-xs opacity-70">{label}</p>
-    </div>
-  )
-}
-
-// Who has reviewed how much. The dashboard stats above are project-wide
-// totals, which cannot tell you whether one person did all of it — this is
-// the per-member view of the same work.
-//
-// Ranked on masks QA'd (pass + fail decisions), read from review_logs
-// rather than masks.reviewed_by: a redo upload clears reviewed_by, so
-// counting masks would strip a reviewer's credit for every mask they failed
-// that later got re-annotated. See fetchMemberProgress for the details.
-//
-// Visible to every member, not owner-gated: it is the same information the
-// Members page already shows, just ordered.
-function ReviewLeaderboard({ projectId }) {
-  const { showError } = useToast()
-  const [rows, setRows] = useState(null)
-
-  useEffect(() => {
-    let alive = true
-    fetchReviewLeaderboard(projectId)
-      .then((r) => alive && setRows(r))
-      .catch((e) => {
-        console.error('fetchReviewLeaderboard failed:', e)
-        if (alive) {
-          setRows([])
-          showError('Could not load the review leaderboard.')
-        }
-      })
-    return () => {
-      alive = false
-    }
-  }, [projectId, showError])
-
-  // Bars are scaled against the top scorer rather than the project total,
-  // so the ranking stays readable when everyone has reviewed a similar
-  // amount — against the total, four even members would all render as
-  // quarter-width stubs.
-  const top = rows?.reduce((n, r) => Math.max(n, r.qad), 0) ?? 0
-
-  return (
-    <div className="mt-6 rounded-xl border border-[#E5E4DF] p-4">
-      <p className="text-sm font-medium text-[#1a1a1a]">Review leaderboard</p>
-      <p className="mt-0.5 text-xs text-[#888780]">
-        Masks each member has QA&rsquo;d — passed plus failed.
-      </p>
-
-      {rows === null && <p className="mt-3 text-sm text-[#888780]">Loading…</p>}
-      {rows?.length === 0 && <p className="mt-3 text-sm text-[#888780]">No members yet.</p>}
-
-      {rows && rows.length > 0 && (
-        <ol className="mt-3 space-y-2.5">
-          {rows.map((r, i) => (
-            <li key={r.reviewer.id} className="flex items-center gap-3">
-              <span className="w-4 flex-shrink-0 text-xs tabular-nums text-[#B4B2A9]">{i + 1}</span>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="truncate text-sm">
-                    {r.reviewer.display_name || r.reviewer.email}
-                  </span>
-                  <span className="flex-shrink-0 text-sm font-medium tabular-nums">{r.qad}</span>
-                </div>
-                <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-[#F1EFE8]">
-                  <div
-                    className="h-full rounded-full bg-[#639922]"
-                    style={{ width: top > 0 ? `${(r.qad / top) * 100}%` : '0%' }}
-                  />
-                </div>
-                <p className="mt-1 text-xs text-[#888780]">
-                  <span className="text-[#27500A]">{r.passed} passed</span> ·{' '}
-                  <span className="text-[#791F1F]">{r.failed} failed</span> · {r.redone} redone ·{' '}
-                  {r.pending + r.redo} outstanding ·{' '}
-                  {r.lastActivityAt ? relativeTime(r.lastActivityAt) : 'no activity'}
-                </p>
-              </div>
-            </li>
-          ))}
-        </ol>
-      )}
     </div>
   )
 }
