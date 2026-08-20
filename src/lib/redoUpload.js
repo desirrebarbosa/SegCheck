@@ -3,6 +3,7 @@ import { uploadFile } from './storage'
 import { clipMaskToBbox } from './maskClip'
 import { encodeCocoRLE } from './rle'
 import { selectAllIn } from './paging'
+import { closeCompletedBatches } from './redoBatches'
 
 // Re-uploading corrected redo masks.
 //
@@ -204,6 +205,16 @@ export async function commitRedoUploadPlan(plan, { userId, projectId, onProgress
       onProgress?.(done, plan.matched.length)
     }
   })
+
+  // A downloaded batch stays OPEN until every mask in it has come back, so
+  // a partial re-upload never releases the remainder of someone's work
+  // mid-annotation. Non-fatal: the masks are already updated, and a batch
+  // closing late only delays that person becoming eligible for a re-level.
+  try {
+    await closeCompletedBatches(projectId, userId)
+  } catch (e) {
+    console.error('closeCompletedBatches failed:', e)
+  }
 
   return summary
 }

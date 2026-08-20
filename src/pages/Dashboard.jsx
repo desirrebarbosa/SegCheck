@@ -170,6 +170,12 @@ export default function Dashboard() {
         membersById,
         onProgress: setRedoProgress,
         signal: controller.signal,
+        // Scoped to one member: this is that person's batch, so claim it for
+        // them. The unscoped "everyone" export spans the whole project and
+        // is deliberately NOT claimed — it is a copy to inspect, and locking
+        // the entire backlog to whoever pressed the button would be wrong.
+        projectId: assigneeId ? projectId : undefined,
+        reviewerId: assigneeId || undefined,
       })
       showSuccess('Redo batch downloaded.')
       setTimeout(() => setZipProgress(null), 400)

@@ -7,6 +7,7 @@ import {
   removeMember,
   rebalanceAllAssignments,
 } from '../lib/projects'
+import { relevelRedo, fetchOpenBatches } from '../lib/redoBatches'
 import { useToast } from '../components/Toast'
 import { relativeTime } from '../lib/relativeTime'
 
@@ -15,6 +16,7 @@ export default function Members() {
   const { showError, showSuccess } = useToast()
   const [members, setMembers] = useState(null)
   const [progress, setProgress] = useState(null) // keyed by reviewer id
+  const [openBatches, setOpenBatches] = useState({}) // reviewer id -> open batch
   const [email, setEmail] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -33,12 +35,15 @@ export default function Members() {
       return
     }
     try {
-      setProgress(
-        await fetchMemberProgress(
+      const [prog, batches] = await Promise.all([
+        fetchMemberProgress(
           projectId,
           roster.map((m) => m.reviewer.id),
         ),
-      )
+        fetchOpenBatches(projectId),
+      ])
+      setProgress(prog)
+      setOpenBatches(batches)
     } catch (e) {
       console.error('fetchMemberProgress failed:', e)
       showError('Could not load member progress.')
@@ -84,6 +89,38 @@ export default function Members() {
       )
     } catch (e) {
       showError('Could not distribute work — ' + e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Distinct from "Distribute unassigned work", which only ever hands out
+  // masks nobody holds and so can never correct an imbalance that already
+  // exists. This RELEASES first — but only work nobody has downloaded, so a
+  // batch someone is mid-way through is untouchable.
+  async function handleRelevel() {
+    if (
+      !confirm(
+        'Re-level the redo backlog?\n\n' +
+          'Work that has been downloaded is left alone. Everything else is ' +
+          'released and split evenly among the members who have nothing open.',
+      )
+    )
+      return
+    setBusy(true)
+    try {
+      const { released, dealt, eligible, busy: heldBack } = await relevelRedo(projectId)
+      await refresh()
+      if (eligible === 0) {
+        showError('Everyone has a downloaded batch open — nothing can be re-levelled yet.')
+      } else {
+        showSuccess(
+          `Re-levelled: ${released} released, ${dealt} split across ${eligible} member(s).` +
+            (heldBack > 0 ? ` ${heldBack} left alone with work in progress.` : ''),
+        )
+      }
+    } catch (e) {
+      showError('Could not re-level the redo backlog — ' + e.message)
     } finally {
       setBusy(false)
     }
@@ -145,6 +182,17 @@ export default function Members() {
         </button>
       )}
 
+      {isOwner && (
+        <button
+          onClick={handleRelevel}
+          disabled={busy}
+          className="mt-2 flex items-center gap-1.5 rounded-lg border border-[#B4B2A9] px-3.5 py-2 text-sm hover:bg-[#F7F7F5] disabled:opacity-50"
+        >
+          <i className="ti ti-scale text-base" aria-hidden="true"></i>
+          Re-level redo backlog
+        </button>
+      )}
+
       <div className="mt-5 divide-y divide-[#E5E4DF] rounded-xl border border-[#E5E4DF]">
         {members === null && <p className="p-4 text-sm text-[#888780]">Loading…</p>}
         {members?.map((m) => (
@@ -153,6 +201,13 @@ export default function Members() {
               <p className="truncate text-sm">{m.reviewer.display_name || m.reviewer.email}</p>
               <p className="truncate text-xs text-[#888780]">{m.reviewer.email}</p>
               <MemberProgress p={progress?.[m.reviewer.id]} loading={progress === null} />
+              {openBatches[m.reviewer.id] && (
+                <p className="mt-1 inline-flex items-center gap-1.5 rounded-lg bg-[#FDF3E7] px-2 py-0.5 text-xs text-[#7A4A12]">
+                  <i className="ti ti-lock text-xs" aria-hidden="true"></i>
+                  Batch {openBatches[m.reviewer.id].batchNumber} downloaded —{' '}
+                  {openBatches[m.reviewer.id].outstanding} left, protected from re-levelling
+                </p>
+              )}
             </div>
             <div className="flex flex-shrink-0 items-center gap-3">
               {m.is_lead && (

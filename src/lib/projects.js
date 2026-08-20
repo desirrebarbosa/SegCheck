@@ -303,6 +303,11 @@ export async function rebalanceAssignments(projectId, status) {
       .eq('project_id', projectId)
       .eq('status', status)
       .is('assigned_to', null)
+      // Never hand out a mask that belongs to a downloaded batch. Such a
+      // mask should already be assigned, so this is belt-and-braces — but
+      // the one thing that must never happen is two people annotating the
+      // same instance because it leaked back into the free pool.
+      .is('redo_batch_id', null)
       // ORDER BY is not optional here. Postgres gives no row-order guarantee
       // without one, so paging with .range() alone can return a row twice
       // across two pages — harmless — or skip one entirely, which silently

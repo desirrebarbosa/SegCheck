@@ -1,3 +1,4 @@
+import { openBatch } from './redoBatches'
 import { collectPhotoMaskEntries, downloadZip } from './zipHelpers'
 import { renderInstancePreview } from './instanceRender'
 
@@ -166,7 +167,19 @@ export function buildInstanceManifestCsv(manifestRows) {
 // Dashboard's global export, Dashboard's per-member export, and MyRedo's
 // self-export — one implementation instead of three copies of the same
 // zip-building loop.
-export async function exportRedoBatch({ rows, filenamePrefix, membersById, onProgress, signal }) {
+export async function exportRedoBatch({
+  rows,
+  filenamePrefix,
+  membersById,
+  onProgress,
+  signal,
+  // Passing both OPENS a batch over exactly what was exported, locking those
+  // masks to that person until they re-upload. Omit them for a read-only
+  // export that should not claim the work (an owner pulling a copy to look
+  // at, say) — the zip is identical either way.
+  projectId,
+  reviewerId,
+}) {
   const failed = rows.filter((r) => r.status === 'fail')
   const { files, manifestRows } = await buildRedoZipFiles(
     failed,
@@ -183,4 +196,16 @@ export async function exportRedoBatch({ rows, filenamePrefix, membersById, onPro
     },
     signal,
   )
+
+  // Only after the download actually succeeds. Opening the batch first would
+  // lock the work to someone whose download then failed or was cancelled,
+  // and nothing would release it until they submitted a batch they never got.
+  if (projectId && reviewerId) {
+    await openBatch(
+      projectId,
+      reviewerId,
+      failed.map((r) => r.id),
+      { note: `${filenamePrefix}-redo.zip` },
+    )
+  }
 }

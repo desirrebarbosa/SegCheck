@@ -54,6 +54,11 @@ export default function MyRedo() {
         membersById,
         onProgress: setProgress,
         signal: abortController.signal,
+        // Claims this download as an open batch: these masks are now locked
+        // to this person and a re-level cannot take them back until they
+        // re-upload.
+        projectId,
+        reviewerId: me?.id,
       })
       showSuccess('Redo batch downloaded.')
     } catch (e) {
