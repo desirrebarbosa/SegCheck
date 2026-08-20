@@ -73,8 +73,11 @@ export async function closeCompletedBatches(projectId, reviewerId) {
 
   const closed = []
   for (const batch of open) {
+    // active_masks, so a mask superseded by a photo re-upload does not hold
+    // the batch open forever: it can never be re-uploaded against, and
+    // waiting on it would leave its owner permanently mid-batch.
     const { count, error: cErr } = await supabase
-      .from('masks')
+      .from('active_masks')
       .select('id', { count: 'exact', head: true })
       .eq('redo_batch_id', batch.id)
       .eq('status', 'fail')
@@ -142,10 +145,15 @@ export async function relevelRedo(projectId) {
 
   // Release: unbatched fail work only. An open batch is somebody's downloaded
   // zip, in progress on their machine.
+  // Read through `active_masks`, NOT raw `masks` — the same rule
+  // rebalanceAssignments follows. Masks on superseded photo versions keep
+  // their status and assignment but render nowhere, so dealing them out
+  // spends real quota on work nobody can open: a member's visible total
+  // comes up short by however many stale rows they were handed.
   const held = await selectAll(
     () =>
       supabase
-        .from('masks')
+        .from('active_masks')
         .select('id')
         .eq('project_id', projectId)
         .eq('status', 'fail')
@@ -172,7 +180,7 @@ export async function relevelRedo(projectId) {
   const pool = await selectAll(
     () =>
       supabase
-        .from('masks')
+        .from('active_masks')
         .select('id')
         .eq('project_id', projectId)
         .eq('status', 'fail')
@@ -185,7 +193,7 @@ export async function relevelRedo(projectId) {
   await Promise.all(
     participants.map(async (id) => {
       const { count, error } = await supabase
-        .from('masks')
+        .from('active_masks')
         .select('id', { count: 'exact', head: true })
         .eq('project_id', projectId)
         .eq('status', 'fail')
@@ -234,7 +242,7 @@ export async function fetchOpenBatches(projectId) {
   await Promise.all(
     data.map(async (b) => {
       const { count, error: cErr } = await supabase
-        .from('masks')
+        .from('active_masks')
         .select('id', { count: 'exact', head: true })
         .eq('redo_batch_id', b.id)
         .eq('status', 'fail')

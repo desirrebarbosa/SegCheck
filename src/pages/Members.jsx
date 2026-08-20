@@ -35,12 +35,9 @@ export default function Members() {
     }
     try {
       const [prog, batches] = await Promise.all([
-        // includeCompleted: false skips the review_logs half — four queries
-        // per member that only fed the numbers this page no longer shows.
         fetchMemberProgress(
           projectId,
           roster.map((m) => m.reviewer.id),
-          { includeCompleted: false },
         ),
         fetchOpenBatches(projectId),
       ])
@@ -250,10 +247,8 @@ export default function Members() {
 // the old "hide when zero" badge made those two identical.
 // Outstanding work only — what this member still has on their plate.
 //
-// The completed-work half (reviewed / passed / failed / redone / last
-// active) is parked in components/MemberProgressFull.jsx, along with the
-// note on how to put it back. Zeroes are still rendered rather than hidden:
-// "cleared their queue" and "never had one" need to look different.
+// Zeroes are rendered rather than hidden: a member who has cleared their
+// queue and one who was never given anything need to look different.
 function MemberProgress({ p, loading }) {
   if (loading) return <p className="mt-1 text-xs text-[#B4B2A9]">Loading progress…</p>
   if (!p) return null

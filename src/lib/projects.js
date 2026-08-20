@@ -111,33 +111,18 @@ export async function listMembers(projectId) {
   return data.map((m, i) => ({ ...m, redo_count: counts[i] }))
 }
 
-// Per-member numbers, for the Members page and the Dashboard leaderboard.
-// Keyed by reviewer id; every listed member gets an entry.
+// Per-member outstanding load, for the Members page. Keyed by reviewer id;
+// every listed member gets an entry.
 //
-// The two halves come from deliberately different places:
+// Read through `active_masks`, not raw `masks`: masks on superseded photo
+// versions stay assigned but render nowhere, so counting them would show a
+// member more outstanding work than they can actually see.
 //
-//   - Outstanding load (`pending`, `redo`) from `active_masks` — what the
-//     person can actually see in their review queue and My Redo right now.
-//     Raw `masks` would include superseded photo versions, i.e. work that
-//     is assigned to them but renders nowhere.
-//
-//   - Work completed (`passed`, `failed`, `redone`) from `review_logs`, NOT
-//     from masks.reviewed_by. A redo upload resets reviewed_by to null (see
-//     commitRedoUploadPlan), so counting masks would quietly erase a
-//     reviewer's credit for every mask they failed that was later
-//     re-annotated — which is precisely the work worth showing. review_logs
-//     is append-only, so it is the only honest record of who did how much.
-//
-// All count-only (`head: true`, no rows returned), run in parallel — the
-// same shape as the load counts in rebalanceAssignments. Cost is one small
-// request per member per metric, which is fine for a project roster; if a
-// roster ever grows past a few dozen people this wants a SQL view instead.
-// `includeCompleted: false` skips the review_logs half entirely, returning
-// only the outstanding-load numbers. That is four fewer requests per member
-// — worth it for the Members page, which shows only `pending` and `redo`.
-// The completed fields come back undefined in that mode, so any caller that
-// renders them must leave the flag alone (see components/MemberProgressFull).
-export async function fetchMemberProgress(projectId, reviewerIds, { includeCompleted = true } = {}) {
+// Count-only (`head: true`, no rows returned), run in parallel — the same
+// shape as the load counts in rebalanceAssignments. Two small requests per
+// member; if a roster ever grows past a few dozen people this wants a SQL
+// view instead.
+export async function fetchMemberProgress(projectId, reviewerIds) {
   const countMasks = async (reviewerId, status) => {
     const { count, error } = await supabase
       .from('active_masks')
@@ -149,81 +134,17 @@ export async function fetchMemberProgress(projectId, reviewerIds, { includeCompl
     return count ?? 0
   }
 
-  const countLogs = async (reviewerId, action) => {
-    // Counted on created_at rather than id: PostgREST validates the column
-    // list even for a head-only count, and created_at is the one column
-    // review_logs is already read by elsewhere (fetchWeeklyActivity).
-    const { count, error } = await supabase
-      .from('review_logs')
-      .select('created_at', { count: 'exact', head: true })
-      .eq('project_id', projectId)
-      .eq('reviewer_id', reviewerId)
-      .eq('action', action)
-    // `action` is a Postgres enum, so filtering on a label the enum does not
-    // have is a 22P02 cast error rather than an empty result. That is not a
-    // reason to blank the whole progress panel — a value the database has
-    // never seen has, definitionally, a count of zero. Keeps the page
-    // working when the code ships ahead of the enum migration.
-    if (error?.code === '22P02') return 0
-    if (error) throw error
-    return count ?? 0
-  }
-
-  const lastActivity = async (reviewerId) => {
-    const { data, error } = await supabase
-      .from('review_logs')
-      .select('created_at')
-      .eq('project_id', projectId)
-      .eq('reviewer_id', reviewerId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle()
-    if (error) throw error
-    return data?.created_at ?? null
-  }
-
   const entries = await Promise.all(
     reviewerIds.map(async (id) => {
       const [pending, redo] = await Promise.all([
         countMasks(id, 'pending'),
         countMasks(id, 'fail'),
       ])
-      if (!includeCompleted) return [id, { pending, redo }]
-
-      const [passed, failed, redone, lastActivityAt] = await Promise.all([
-        countLogs(id, 'confirm_pass'),
-        countLogs(id, 'confirm_fail'),
-        countLogs(id, 'redo_upload'),
-        lastActivity(id),
-      ])
-      // `qad` — pass + fail decisions — is the "how much reviewing did this
-      // person actually do" number, and what the leaderboard ranks on.
-      return [id, { pending, redo, passed, failed, qad: passed + failed, redone, lastActivityAt }]
+      return [id, { pending, redo }]
     }),
   )
 
   return Object.fromEntries(entries)
-}
-
-// Roster joined to progress, ranked by masks reviewed. Ties break on passed
-// then on name, so the order is stable rather than dependent on whatever
-// order the roster query happened to return.
-export async function fetchReviewLeaderboard(projectId) {
-  const members = await listMembers(projectId)
-  const progress = await fetchMemberProgress(
-    projectId,
-    members.map((m) => m.reviewer.id),
-  )
-  return members
-    .map((m) => ({ reviewer: m.reviewer, is_lead: m.is_lead, ...progress[m.reviewer.id] }))
-    .sort(
-      (a, b) =>
-        b.qad - a.qad ||
-        b.passed - a.passed ||
-        (a.reviewer.display_name || a.reviewer.email).localeCompare(
-          b.reviewer.display_name || b.reviewer.email,
-        ),
-    )
 }
 
 // Add an existing SegCheck account to the project by email, then give them
