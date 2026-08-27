@@ -17,6 +17,27 @@ import { distributeEvenly } from './redoDistribution'
 // Rows per `.in()` — matches paging.js, same URL-length reason.
 const UPDATE_CHUNK = IN_CHUNK
 
+// `active_masks` does NOT expose redo_batch_id: the view has a fixed column
+// list that predates the column, so `select redo_batch_id from active_masks`
+// is a 42703. Anything needing BOTH facts — "is this mask still on the latest
+// photo version" AND "is it inside a batch" — therefore reads redo_batch_id
+// from the base table and intersects against this id set.
+//
+// (Adding the column to the view would let both filters live in one query;
+// that needs the view recreated, which is a migration, not a code change.)
+async function fetchActiveFailIds(projectId) {
+  const rows = await selectAll(
+    () =>
+      supabase
+        .from('active_masks')
+        .select('id')
+        .eq('project_id', projectId)
+        .eq('status', 'fail'),
+    { orderBy: 'id' },
+  )
+  return new Set(rows.map((r) => r.id))
+}
+
 // Opens a batch for `reviewerId` covering `maskIds`, and stamps those masks
 // so nothing can re-deal them until the batch is submitted. Called at export
 // time — the moment the work actually leaves the app.
@@ -71,18 +92,18 @@ export async function closeCompletedBatches(projectId, reviewerId) {
     .is('submitted_at', null)
   if (error) throw error
 
+  // Superseded masks must not hold a batch open forever: they can never be
+  // re-uploaded against, so waiting on them would leave their owner
+  // permanently mid-batch.
+  const activeFail = await fetchActiveFailIds(projectId)
+
   const closed = []
   for (const batch of open) {
-    // active_masks, so a mask superseded by a photo re-upload does not hold
-    // the batch open forever: it can never be re-uploaded against, and
-    // waiting on it would leave its owner permanently mid-batch.
-    const { count, error: cErr } = await supabase
-      .from('active_masks')
-      .select('id', { count: 'exact', head: true })
-      .eq('redo_batch_id', batch.id)
-      .eq('status', 'fail')
-    if (cErr) throw cErr
-    if ((count ?? 0) > 0) continue // still outstanding
+    const rows = await selectAll(
+      () => supabase.from('masks').select('id').eq('redo_batch_id', batch.id).eq('status', 'fail'),
+      { orderBy: 'id' },
+    )
+    if (rows.some((r) => activeFail.has(r.id))) continue // still outstanding
 
     const { error: uErr } = await supabase
       .from('redo_batches')
@@ -150,17 +171,20 @@ export async function relevelRedo(projectId) {
   // their status and assignment but render nowhere, so dealing them out
   // spends real quota on work nobody can open: a member's visible total
   // comes up short by however many stale rows they were handed.
-  const held = await selectAll(
-    () =>
-      supabase
-        .from('active_masks')
-        .select('id')
-        .eq('project_id', projectId)
-        .eq('status', 'fail')
-        .is('redo_batch_id', null)
-        .not('assigned_to', 'is', null),
-    { orderBy: 'id' },
-  )
+  const activeFail = await fetchActiveFailIds(projectId)
+  const held = (
+    await selectAll(
+      () =>
+        supabase
+          .from('masks')
+          .select('id')
+          .eq('project_id', projectId)
+          .eq('status', 'fail')
+          .is('redo_batch_id', null)
+          .not('assigned_to', 'is', null),
+      { orderBy: 'id' },
+    )
+  ).filter((m) => activeFail.has(m.id))
   for (let i = 0; i < held.length; i += UPDATE_CHUNK) {
     const { error } = await supabase
       .from('masks')
@@ -177,17 +201,19 @@ export async function relevelRedo(projectId) {
   // and seeding it means distributeEvenly levels TOTALS: someone already
   // holding 969 is topped up to the same total as everyone else rather than
   // being handed a full share on top, or skipped entirely.
-  const pool = await selectAll(
-    () =>
-      supabase
-        .from('active_masks')
-        .select('id')
-        .eq('project_id', projectId)
-        .eq('status', 'fail')
-        .is('redo_batch_id', null)
-        .is('assigned_to', null),
-    { orderBy: 'id' },
-  )
+  const pool = (
+    await selectAll(
+      () =>
+        supabase
+          .from('masks')
+          .select('id')
+          .eq('project_id', projectId)
+          .eq('status', 'fail')
+          .is('redo_batch_id', null)
+          .is('assigned_to', null),
+      { orderBy: 'id' },
+    )
+  ).filter((m) => activeFail.has(m.id))
 
   const load = new Map(participants.map((id) => [id, 0]))
   await Promise.all(
@@ -238,19 +264,18 @@ export async function fetchOpenBatches(projectId) {
     .is('submitted_at', null)
   if (error) throw error
 
+  const activeFail = await fetchActiveFailIds(projectId)
   const byReviewer = {}
   await Promise.all(
     data.map(async (b) => {
-      const { count, error: cErr } = await supabase
-        .from('active_masks')
-        .select('id', { count: 'exact', head: true })
-        .eq('redo_batch_id', b.id)
-        .eq('status', 'fail')
-      if (cErr) throw cErr
+      const rows = await selectAll(
+        () => supabase.from('masks').select('id').eq('redo_batch_id', b.id).eq('status', 'fail'),
+        { orderBy: 'id' },
+      )
       byReviewer[b.reviewer_id] = {
         batchNumber: b.batch_number,
         exportedAt: b.exported_at,
-        outstanding: count ?? 0,
+        outstanding: rows.filter((r) => activeFail.has(r.id)).length,
       }
     }),
   )
