@@ -6,3 +6,8 @@ src.zip
 .env.*.local
 *.log
 .DS_Store
+__pycache__/
+
+# Raw production dump / datasets — not source, may contain real user data.
+segcheck_dump.sql
+jodd/
