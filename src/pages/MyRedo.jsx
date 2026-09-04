@@ -3,7 +3,7 @@ import { useOutletContext } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { fetchMyRedoAssignments, fetchMyCorrectionCount } from '../lib/projects'
 import { getSignedUrl } from '../lib/storage'
-import { fetchGuide, isGuideApiConfigured } from '../lib/guideApi'
+import { fetchGuide, isGuideApiConfigured } from '../lib/apiHelper'
 import { exportRedoBatch, exportOverallPercent, exportPhaseLabel } from '../lib/exportRedo'
 import { uploadCorrectionZip } from '../lib/correctionUpload'
 import { useToast } from '../components/Toast'
@@ -95,9 +95,13 @@ export default function MyRedo() {
         rows: items,
         filenamePrefix: `${project?.name ?? 'my'}-redo`,
         membersById,
-        projectId,
         onProgress: setDownloadProgress,
         signal: abortController.signal,
+        // Claims this download as an open batch: these masks are now locked
+        // to this person and a re-level cannot take them back until they
+        // re-upload.
+        projectId,
+        reviewerId: me?.id,
       })
       showSuccess('Redo batch downloaded.')
     } catch (e) {

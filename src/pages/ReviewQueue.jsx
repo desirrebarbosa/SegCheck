@@ -9,6 +9,7 @@ import {
   rebalanceAssignments,
 } from '../lib/projects'
 import { useToast } from '../components/Toast'
+import { selectAll } from '../lib/paging'
 
 // How many pending masks to hold in the local queue at once, and how close
 // to the end of it we get before quietly fetching more (so Next never has
@@ -17,7 +18,7 @@ const QUEUE_BATCH_SIZE = 25
 const REFILL_THRESHOLD = 5
 
 const MASK_COLUMNS = `id, manifest_mask_id, storage_path, category, bbox, segmentation, is_crowd,
-         photo_id, photo_filename, photo_storage_path, created_at`
+         photo_id, photo_filename, photo_storage_path, created_at, reviewed_at`
 
 export default function ReviewQueue() {
   const { projectId } = useOutletContext()
@@ -69,6 +70,10 @@ export default function ReviewQueue() {
         .eq('project_id', projectId)
         .eq('status', 'pending'),
     )
+      // Not-yet-skipped masks (reviewed_at still null) come first by creation
+      // order; skipped ones sort after, oldest-skip-first — see decide()'s
+      // skip handler below for why reviewed_at gets bumped on skip.
+      .order('reviewed_at', { ascending: true, nullsFirst: true })
       .order('created_at', { ascending: true })
       .limit(QUEUE_BATCH_SIZE)
     setQueueLoading(false)
@@ -82,8 +87,10 @@ export default function ReviewQueue() {
   }, [projectId, showError, userId, scopeToMode])
 
   const fetchMore = useCallback(
-    async (afterCreatedAt) => {
+    async (offset) => {
       if (!userId) return []
+      // Range-based rather than a created_at cursor: the two-column sort
+      // above can't be paged correctly with a single-column cursor.
       const { data, error } = await scopeToMode(
         supabase
           .from('active_masks')
@@ -91,9 +98,9 @@ export default function ReviewQueue() {
           .eq('project_id', projectId)
           .eq('status', 'pending'),
       )
-        .gt('created_at', afterCreatedAt)
+        .order('reviewed_at', { ascending: true, nullsFirst: true })
         .order('created_at', { ascending: true })
-        .limit(QUEUE_BATCH_SIZE)
+        .range(offset, offset + QUEUE_BATCH_SIZE - 1)
       if (error) {
         console.error('fetchMore failed:', error)
         return []
@@ -108,9 +115,8 @@ export default function ReviewQueue() {
   useEffect(() => {
     if (queue.length === 0) return
     if (queueIndex < queue.length - REFILL_THRESHOLD) return
-    const last = queue[queue.length - 1]
     let cancelled = false
-    fetchMore(last.created_at).then((more) => {
+    fetchMore(queue.length).then((more) => {
       if (cancelled || more.length === 0) return
       setQueue((q) => {
         const existingIds = new Set(q.map((m) => m.id))
@@ -140,17 +146,20 @@ export default function ReviewQueue() {
     // Categories stay project-wide: they drive the class-color picker,
     // which is per-project config rather than anyone's personal workload.
     // No categories table, so fetch the column and dedupe client-side.
-    const { data: catData, error: catError } = await supabase
-      .from('active_masks')
-      .select('category')
-      .eq('project_id', projectId)
-    
-    if (!catError && catData) {
+    // Paged: the distinct list is derived from every mask row, so a read
+    // truncated at 1000 drops whole classes out of the color picker.
+    try {
+      const catData = await selectAll(
+        () => supabase.from('active_masks').select('id, category').eq('project_id', projectId),
+        { orderBy: 'id' },
+      )
       const cats = new Set()
       for (const row of catData) {
         if (row.category) cats.add(row.category)
       }
       setCategories([...cats].sort())
+    } catch (e) {
+      console.error('category load failed:', e)
     }
   }, [projectId, userId])
 
@@ -196,6 +205,21 @@ export default function ReviewQueue() {
     setQueueIndex((i) => Math.min(queue.length - 1, i + 1))
   }
 
+  // Persists the skip so it sticks to the back of the line on reload/other
+  // devices too, not just for this session. Fire-and-forget: the local
+  // skip (goNext) already happened, and a failed bump just means this one
+  // mask's position won't persist — not worth blocking the UI over.
+  function skipMask(maskId) {
+    supabase
+      .from('masks')
+      .update({ reviewed_at: new Date().toISOString() })
+      .eq('id', maskId)
+      .eq('status', 'pending')
+      .then(({ error }) => {
+        if (error) console.error('skipMask failed:', error)
+      })
+  }
+
   async function decide(status) {
     if (!mask) return
     setBusy(true)
@@ -211,7 +235,13 @@ export default function ReviewQueue() {
       // failed it. Leaving assigned_to set would make the reviewer the
       // permanent owner of every mask they rejected and bypass redo
       // distribution entirely.
-      const { error: updErr } = await supabase
+      // `.eq('status', 'pending')` makes this a no-op if someone else has
+      // already decided this mask. "Help others" mode deliberately serves
+      // work assigned to other people, so two reviewers landing on the same
+      // mask is a normal race, not an edge case — and without the guard the
+      // second decision silently overwrote the first, including flipping an
+      // already-actioned fail back out of someone's redo pile.
+      const { data: updated, error: updErr } = await supabase
         .from('masks')
         .update({
           status,
@@ -220,7 +250,21 @@ export default function ReviewQueue() {
           assigned_to: null,
         })
         .eq('id', mask.id)
+        .eq('status', 'pending')
+        .select('id')
       if (updErr) throw updErr
+
+      if (updated.length === 0) {
+        // Already decided by someone else. Drop it from the local queue so
+        // it stops being offered, but write no log row — we did not decide
+        // it, and claiming otherwise would corrupt the leaderboard.
+        const skipIndex = queueIndex
+        const withoutIt = [...queue.slice(0, skipIndex), ...queue.slice(skipIndex + 1)]
+        setQueue(withoutIt)
+        setQueueIndex(Math.min(skipIndex, Math.max(0, withoutIt.length - 1)))
+        showError('Someone else already reviewed that one — skipping it.')
+        return
+      }
       await supabase.from('review_logs').insert({
         project_id: projectId,
         mask_id: mask.id,
@@ -247,7 +291,14 @@ export default function ReviewQueue() {
         try {
           await rebalanceAssignments(projectId, 'fail')
         } catch (e) {
+          // Surfaced, not just logged: the decision is saved either way, but
+          // the mask is now sitting unassigned in nobody's My Redo while the
+          // dashboard still counts it. Silently swallowing that made the gap
+          // invisible until someone queried the database directly.
           console.error('rebalanceAssignments after fail failed:', e)
+          showError(
+            'Saved the fail, but could not hand it out for re-annotation — a lead can press “Distribute unassigned work” on the Members page.',
+          )
         }
       }
 
@@ -389,7 +440,10 @@ export default function ReviewQueue() {
                 </span>
                 <button
                   disabled={!canGoNext}
-                  onClick={goNext}
+                  onClick={() => {
+                    if (mask) skipMask(mask.id)
+                    goNext()
+                  }}
                   aria-label="Skip to next, come back later"
                   title="Not sure yet — skip for now"
                   className="flex h-8 w-8 items-center justify-center rounded-full text-[#5F5E5A] transition hover:bg-[#F1EFE8] disabled:cursor-not-allowed disabled:opacity-30"

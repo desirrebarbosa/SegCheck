@@ -36,7 +36,12 @@ export default function MaskOverlay({
   const canvasRef = useRef(null)
   const containerRef = useRef(null)
   const wrapperRef = useRef(null) // outer, full-width element used to measure available space
+  // `error` is fatal (no photo = nothing to review). `warning` is not: the
+  // raster mask failing still leaves the photo, the RLE/polygon overlay
+  // and the bbox, which is usually enough to make a call.
   const [error, setError] = useState(null)
+  const [warning, setWarning] = useState(null)
+  const [retryNonce, setRetryNonce] = useState(0)
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [isDragging, setIsDragging] = useState(false)
@@ -76,17 +81,36 @@ export default function MaskOverlay({
     let alive = true
 
     async function draw() {
+      // Reset both every time. Without this a single bad file used to
+      // stick: `error` was set but never cleared, so the component's
+      // early-return kept showing that one failure for every subsequent
+      // mask in the queue, and only a full page reload cleared it.
+      setError(null)
+      setWarning(null)
       try {
         let { photo, mask } = imagesRef.current
         if (!photo || photo.__path !== photoPath) {
-          const url = await getSignedUrl(photoPath)
-          photo = await loadImage(url)
-          photo.__path = photoPath
+          // Thrown, not wrapped: there's no underlying failure to report,
+          // the row simply has no photo path.
+          if (!photoPath) throw new Error('This mask has no photo on file.')
+          try {
+            photo = await loadImage(await getSignedUrl(photoPath))
+            photo.__path = photoPath
+          } catch (e) {
+            throw new Error(`Couldn’t load the photo — ${e.message}`)
+          }
         }
         if (maskPath && (!mask || mask.__path !== maskPath)) {
-          const url = await getSignedUrl(maskPath)
-          mask = await loadImage(url)
-          mask.__path = maskPath
+          // Non-fatal on purpose: fall through and draw everything else.
+          try {
+            mask = await loadImage(await getSignedUrl(maskPath))
+            mask.__path = maskPath
+          } catch (e) {
+            mask = null
+            if (alive) {
+              setWarning(`Mask image unavailable — ${e.message} Showing the outline only.`)
+            }
+          }
         } else if (!maskPath) {
           mask = null
         }
@@ -119,7 +143,25 @@ export default function MaskOverlay({
       alive = false
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [photoPath, maskPath, bbox, segmentation, opacities, bboxColor, polygonColor])
+  }, [
+    photoPath,
+    maskPath,
+    bbox,
+    segmentation,
+    opacities,
+    bboxColor,
+    polygonColor,
+    retryNonce,
+  ])
+
+  // Drops whatever was cached so a retry re-signs the URL and refetches,
+  // rather than replaying the same failure against a stale entry. Also
+  // covers the one genuinely recoverable case: a signed URL that expired
+  // while the tab sat open (they last an hour).
+  function retry() {
+    imagesRef.current = { photo: null, mask: null }
+    setRetryNonce((n) => n + 1)
+  }
 
   // Keeps the photo from being dragged/zoomed fully out of view — allows
   // panning until the edge is `slack` px past the container edge, rather
@@ -226,10 +268,28 @@ export default function MaskOverlay({
     }
   }
 
-  if (error) return <p className="text-sm text-[#791F1F]">{error}</p>
+  if (error) {
+    return (
+      <div className="rounded-lg border border-[#E5C4C4] bg-[#FCEBEB] p-4 text-sm">
+        <p className="font-medium text-[#791F1F]">{error}</p>
+        <p className="mt-1 text-xs text-[#791F1F]">
+          Only this mask is affected — Skip moves to the next one.
+        </p>
+        <button
+          onClick={retry}
+          className="mt-3 rounded-lg border border-[#B4B2A9] bg-white px-3 py-1.5 text-xs hover:bg-[#F7F7F5]"
+        >
+          Try again
+        </button>
+      </div>
+    )
+  }
 
   return (
     <div ref={wrapperRef} className="flex w-full flex-col items-center gap-2">
+      {warning && (
+        <p className="w-full rounded-lg bg-[#FBF3E4] px-3 py-2 text-xs text-[#7A4F1D]">{warning}</p>
+      )}
       <div
         ref={containerRef}
         onPointerDown={onPointerDown}
