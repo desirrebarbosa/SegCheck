@@ -6,10 +6,14 @@
 //   - A mask matches an original when their *stems* match (mask stem = filename
 //     with the leading "sam_" and the extension removed).
 
+// "fish/fish01.jpg" -> "fish01.jpg"
+export function baseName(path) {
+  return String(path).split(/[\\/]/).pop() // drop any directories
+}
+
 // "fish/fish01.jpg" -> "fish01"   |   "sam_fish01.png" -> "sam_fish01"
 export function fileStem(path) {
-  const base = String(path).split(/[\\/]/).pop() // drop any directories
-  return base.replace(/\.[^.]+$/, '') // drop the extension
+  return baseName(path).replace(/\.[^.]+$/, '') // drop the extension
 }
 
 // Mask stem with the required "sam_" prefix stripped: "sam_fish01.png" -> "fish01".

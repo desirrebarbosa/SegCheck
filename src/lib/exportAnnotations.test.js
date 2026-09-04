@@ -80,6 +80,30 @@ describe('assembleCocoAnnotations', () => {
     ])
   })
 
+  // photo_filename is stored verbatim from the original import's COCO
+  // file_name, which may carry the dataset's own directory prefix (e.g.
+  // "coco_valid_data/images/foo.jpg"). The exported file_name must always be
+  // a bare basename so it matches the actual images/ folder a downstream
+  // consumer unzips this JSON next to.
+  it('strips any directory prefix from photoFilename in the emitted file_name', () => {
+    const { images } = assembleCocoAnnotations([
+      {
+        photoId: 'photo-a',
+        photoFilename: 'coco_valid_data/images/2K0263OUTUM108_117.jpg',
+        category: 'fish',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '1',
+        segmentation: rle,
+        area: 5,
+        width: 100,
+        height: 100,
+      },
+    ])
+
+    expect(images).toEqual([{ id: 1, file_name: '2K0263OUTUM108_117.jpg', width: 100, height: 100 }])
+  })
+
   it('always emits every JODD_CLASSES category in fixed order, regardless of which are present in instances', () => {
     const { categories } = assembleCocoAnnotations([
       {

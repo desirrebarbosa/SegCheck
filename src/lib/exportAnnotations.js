@@ -30,6 +30,7 @@ import { downloadBlob } from './storage'
 import { encodeCocoRLE, decodeCocoRLE, isRLE } from './rle'
 import { clipForegroundOutsideBbox, binarize } from './maskClip'
 import { JODD_CLASSES } from './joddClasses'
+import { baseName } from './coco'
 
 export const ANNOTATION_STATUSES = ['pass', 'fixed']
 
@@ -102,7 +103,7 @@ export function assembleCocoAnnotations(instances) {
 
   const images = photoIds.map((id) => {
     const m = photoMeta.get(id)
-    return { id: imageIdByPhotoId.get(id), file_name: m.fileName, width: m.width, height: m.height }
+    return { id: imageIdByPhotoId.get(id), file_name: baseName(m.fileName), width: m.width, height: m.height }
   })
 
   const categories = categoryNames.map((name) => ({ id: categoryIdByName.get(name), name }))
