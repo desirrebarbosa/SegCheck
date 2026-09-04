@@ -27,6 +27,13 @@ async function fetchStatusCounts(projectId) {
       counts[status] = count ?? 0
     }),
   )
+  const { count: fixedCount, error: fixedError } = await supabase
+    .from('masks')
+    .select('id', { count: 'exact', head: true })
+    .eq('project_id', projectId)
+    .eq('status', 'fixed')
+  if (fixedError) throw fixedError
+  counts.fixed = fixedCount ?? 0
   return counts
 }
 
@@ -197,10 +204,12 @@ export default function Dashboard() {
       <h2 className="text-lg font-medium">Dashboard</h2>
 
       {counts && (
-        <div className="mt-4 grid grid-cols-3 gap-3 sm:max-w-md">
+        <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-5">
           <Stat label="Pending" value={counts.pending} />
           <Stat label="Pass" value={counts.pass} tone="success" />
-          <Stat label="Fail" value={counts.fail} tone="danger" />
+          <Stat label="Needs redo" value={counts.fail} tone="danger" />
+          <Stat label="Corrected" value={counts.fixed} tone="success" />
+          <Stat label="Total complete" value={counts.pass + counts.fixed} tone="success" />
         </div>
       )}
 

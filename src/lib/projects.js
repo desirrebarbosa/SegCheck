@@ -383,6 +383,20 @@ export async function fetchMyRedoAssignments(projectId, reviewerId) {
   )
 }
 
+// Total corrections this reviewer has successfully submitted for this
+// project. Reads mask_corrections rather than active_masks/masks because a
+// correction's mask has assigned_to cleared on submit (see
+// submit_corrections) — mask_corrections is the durable record.
+export async function fetchMyCorrectionCount(projectId, reviewerId) {
+  const { count, error } = await supabase
+    .from('mask_corrections')
+    .select('id', { count: 'exact', head: true })
+    .eq('project_id', projectId)
+    .eq('submitted_by', reviewerId)
+  if (error) throw error
+  return count ?? 0
+}
+
 // Remove a member from a project. Gated to owner-only in the UI (RLS also
 // only allows a project lead to delete rows via projects_delete-style
 // policies — owner is additionally enforced client-side per your call that

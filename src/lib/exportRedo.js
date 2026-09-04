@@ -53,7 +53,7 @@ export function exportPhaseLabel(progress) {
 // than finishing out the batch first.
 export async function buildRedoZipFiles(
   rows,
-  { membersById = new Map() } = {},
+  { membersById = new Map(), projectId = '', batchId = '', split = '' } = {},
   onProgress,
   signal,
 ) {
@@ -75,6 +75,12 @@ export async function buildRedoZipFiles(
     const maskBlob = maskBlobs.get(r.id) ?? null
     const previewPath = `previews/${r.photo_filename}/${instanceKey}.png`
 
+    // Derive the format from the existing mask's storage path, falling back
+    // to 'png' (the most common raster format). Callers that produce COCO
+    // JSON corrections should still place a .json file under corrections/.
+    const existingExt = r.storage_path ? r.storage_path.split('.').pop().toLowerCase() : ''
+    const format = existingExt === 'json' ? 'coco_json' : 'png'
+
     try {
       const previewBlob = await renderInstancePreview({
         photoBlob,
@@ -88,6 +94,9 @@ export async function buildRedoZipFiles(
     }
 
     const member = membersById.get(r.assigned_to)
+    // The correction_path tells the importer exactly where to look for the
+    // corrected file inside the corrections/ folder of the uploaded ZIP.
+    const correctionPath = `corrections/${r.id}.${format === 'coco_json' ? 'json' : 'png'}`
     manifestRows.push({
       photo_filename: r.photo_filename,
       instance_id: r.id,
@@ -98,6 +107,13 @@ export async function buildRedoZipFiles(
       assigned_to_email: member?.email ?? '',
       preview_path: previewPath,
       mask_path: r.storage_path ? `masks/${r.photo_filename}/${r.storage_path.split('/').pop()}` : '',
+      // Correction metadata — used by the correction ZIP importer to verify
+      // provenance and locate each corrected file inside the upload.
+      project_id: projectId,
+      batch_id: batchId,
+      split,
+      correction_path: correctionPath,
+      format,
     })
 
     onProgress?.({ phase: 'render', done: i + 1, total: rows.length })
@@ -127,6 +143,12 @@ export function buildInstanceManifestCsv(manifestRows) {
     'assigned_to_email',
     'preview_path',
     'mask_path',
+    // Correction metadata — read by the correction ZIP importer.
+    'project_id',
+    'batch_id',
+    'split',
+    'correction_path',
+    'format',
   ]
 
   const lines = [
@@ -134,6 +156,7 @@ export function buildInstanceManifestCsv(manifestRows) {
     csvField('reason=missing: no mask was ever produced for this object (do it from scratch).'),
     csvField('reason=rejected: a mask existed but a reviewer rejected it (redo/fix it).'),
     csvField('preview_path is a flattened image showing exactly which object is flagged.'),
+    csvField('correction_path: place your corrected file at this path inside the corrections/ folder.'),
     '',
     header.map(csvField).join(','),
     ...manifestRows.map((r) => {
@@ -151,6 +174,11 @@ export function buildInstanceManifestCsv(manifestRows) {
         r.assigned_to_email,
         r.preview_path,
         r.mask_path,
+        r.project_id ?? '',
+        r.batch_id ?? '',
+        r.split ?? '',
+        r.correction_path ?? '',
+        r.format ?? '',
       ]
         .map(csvField)
         .join(',')
@@ -171,19 +199,21 @@ export async function exportRedoBatch({
   rows,
   filenamePrefix,
   membersById,
+  projectId = '',
+  batchId = '',
+  split = '',
   onProgress,
   signal,
-  // Passing both OPENS a batch over exactly what was exported, locking those
-  // masks to that person until they re-upload. Omit them for a read-only
-  // export that should not claim the work (an owner pulling a copy to look
-  // at, say) — the zip is identical either way.
-  projectId,
+  // Passing reviewerId (alongside projectId) OPENS a batch over exactly what
+  // was exported, locking those masks to that person until they re-upload.
+  // Omit it for a read-only export that should not claim the work (an owner
+  // pulling a copy to look at, say) — the zip is identical either way.
   reviewerId,
 }) {
   const failed = rows.filter((r) => r.status === 'fail')
   const { files, manifestRows } = await buildRedoZipFiles(
     failed,
-    { membersById },
+    { membersById, projectId, batchId, split },
     onProgress,
     signal,
   )
