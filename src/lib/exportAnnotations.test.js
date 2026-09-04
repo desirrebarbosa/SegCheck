@@ -5,6 +5,7 @@ import {
   assembleCocoAnnotations,
   correctedAnnotationsFilename,
 } from './exportAnnotations.js'
+import { JODD_CLASSES } from './joddClasses.js'
 
 describe('countArea', () => {
   it('counts non-zero entries', () => {
@@ -45,8 +46,8 @@ describe('resolveJsonSegmentation', () => {
 describe('assembleCocoAnnotations', () => {
   const rle = { size: [100, 100], counts: 'xyz' }
 
-  it('mints sequential image and category ids ordered by filename/name', () => {
-    const { images, categories } = assembleCocoAnnotations([
+  it('mints sequential image ids ordered by filename', () => {
+    const { images } = assembleCocoAnnotations([
       {
         photoId: 'photo-b',
         photoFilename: 'b.jpg',
@@ -77,10 +78,41 @@ describe('assembleCocoAnnotations', () => {
       { id: 1, file_name: 'a.jpg', width: 100, height: 100 },
       { id: 2, file_name: 'b.jpg', width: 100, height: 100 },
     ])
-    expect(categories).toEqual([
-      { id: 1, name: 'fish' },
-      { id: 2, name: 'shark' },
+  })
+
+  it('always emits every JODD_CLASSES category in fixed order, regardless of which are present in instances', () => {
+    const { categories } = assembleCocoAnnotations([
+      {
+        photoId: 'photo-b',
+        photoFilename: 'b.jpg',
+        category: 'shark',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '2',
+        segmentation: rle,
+        area: 10,
+        width: 100,
+        height: 100,
+      },
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: 'fish',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '1',
+        segmentation: rle,
+        area: 5,
+        width: 100,
+        height: 100,
+      },
     ])
+
+    expect(categories).toEqual(JODD_CLASSES.map((name, i) => ({ id: i + 1, name })))
+    // canary: id is positional (JODD_CLASSES order), not alphabetical-among-what's-present —
+    // 'shark' appears first in the instances array but must still sort after 'fish'.
+    expect(categories.find((c) => c.name === 'fish').id).toBe(6)
+    expect(categories.find((c) => c.name === 'shark').id).toBe(7)
   })
 
   it('builds annotation objects in the coco.json/seg_coco.json convention', () => {
@@ -103,7 +135,7 @@ describe('assembleCocoAnnotations', () => {
       {
         id: 500,
         image_id: 1,
-        category_id: 1,
+        category_id: 6,
         bbox: [1, 2, 3, 4],
         area: 42,
         iscrowd: 1,
@@ -162,7 +194,7 @@ describe('assembleCocoAnnotations', () => {
     expect(annotations.every((a) => a.image_id === 1)).toBe(true)
   })
 
-  it('falls back to "(uncategorized)" for a null category', () => {
+  it('falls back to "(uncategorized)" for a null category, appended after the known JODD_CLASSES', () => {
     const { categories, annotations } = assembleCocoAnnotations([
       {
         photoId: 'photo-a',
@@ -177,8 +209,56 @@ describe('assembleCocoAnnotations', () => {
         height: 100,
       },
     ])
-    expect(categories).toEqual([{ id: 1, name: '(uncategorized)' }])
-    expect(annotations[0].category_id).toBe(1)
+    expect(categories).toEqual([
+      ...JODD_CLASSES.map((name, i) => ({ id: i + 1, name })),
+      { id: 21, name: '(uncategorized)' },
+    ])
+    expect(annotations[0].category_id).toBe(21)
+  })
+
+  it('dedupes and alphabetically sorts multiple unknown category names, appending them after the known 20', () => {
+    const { categories } = assembleCocoAnnotations([
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: 'zzz-typo',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '1',
+        segmentation: rle,
+        area: 1,
+        width: 100,
+        height: 100,
+      },
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: 'aaa-typo',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '2',
+        segmentation: rle,
+        area: 1,
+        width: 100,
+        height: 100,
+      },
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: 'aaa-typo',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '3',
+        segmentation: rle,
+        area: 1,
+        width: 100,
+        height: 100,
+      },
+    ])
+    expect(categories.slice(20)).toEqual([
+      { id: 21, name: 'aaa-typo' },
+      { id: 22, name: 'zzz-typo' },
+    ])
   })
 })
 

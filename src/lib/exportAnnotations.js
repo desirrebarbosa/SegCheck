@@ -15,14 +15,21 @@
 //
 // Neither the original numeric image_id nor category_id survive import
 // (masks keep only the photo's UUID and the category NAME — see
-// uploads.js), so this mints fresh sequential ids for both, ordered by
-// filename/name so re-running the export is deterministic.
+// uploads.js), so this mints fresh ids for both: image ids are
+// sequential, ordered by filename, so re-running the export is
+// deterministic; category ids are fixed by each name's position in
+// JODD_CLASSES (joddClasses.js), so category_id is identical across
+// every split's JSON regardless of which classes that split actually
+// contains. Any category name outside the 20 known classes (including
+// the legacy '(uncategorized)' fallback below) is appended afterward,
+// sorted alphabetically among itself, with ids continuing past 20.
 
 import { supabase } from './supabaseClient'
 import { selectAll, selectAllIn } from './paging'
 import { downloadBlob } from './storage'
 import { encodeCocoRLE, decodeCocoRLE, isRLE } from './rle'
 import { clipForegroundOutsideBbox, binarize } from './maskClip'
+import { JODD_CLASSES } from './joddClasses'
 
 export const ANNOTATION_STATUSES = ['pass', 'fixed']
 
@@ -86,7 +93,11 @@ export function assembleCocoAnnotations(instances) {
   )
   const imageIdByPhotoId = new Map(photoIds.map((id, i) => [id, i + 1]))
 
-  const categoryNames = [...new Set(instances.map((inst) => inst.category ?? '(uncategorized)'))].sort()
+  const knownNames = new Set(JODD_CLASSES)
+  const unknownNames = [...new Set(instances.map((inst) => inst.category ?? '(uncategorized)'))]
+    .filter((name) => !knownNames.has(name))
+    .sort()
+  const categoryNames = [...JODD_CLASSES, ...unknownNames]
   const categoryIdByName = new Map(categoryNames.map((name, i) => [name, i + 1]))
 
   const images = photoIds.map((id) => {
