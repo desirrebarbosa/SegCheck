@@ -11,3 +11,4 @@ __pycache__/
 # Raw production dump / datasets — not source, may contain real user data.
 segcheck_dump.sql
 jodd/
+local-db

@@ -1,0 +1,195 @@
+import { describe, it, expect } from 'vitest'
+import {
+  countArea,
+  resolveJsonSegmentation,
+  assembleCocoAnnotations,
+  correctedAnnotationsFilename,
+} from './exportAnnotations.js'
+
+describe('countArea', () => {
+  it('counts non-zero entries', () => {
+    expect(countArea(new Uint8Array([0, 1, 1, 0, 1]))).toBe(3)
+  })
+
+  it('is zero for an all-background mask', () => {
+    expect(countArea(new Uint8Array([0, 0, 0]))).toBe(0)
+  })
+})
+
+describe('resolveJsonSegmentation', () => {
+  const rle = { size: [10, 10], counts: 'abc' }
+
+  it('accepts a bare RLE object', () => {
+    expect(resolveJsonSegmentation(rle)).toEqual(rle)
+  })
+
+  it('accepts an RLE nested under a segmentation key', () => {
+    expect(resolveJsonSegmentation({ segmentation: rle, other: 'field' })).toEqual(rle)
+  })
+
+  it('rejects a polygon array — no pixel dimensions to rasterize against', () => {
+    expect(resolveJsonSegmentation([1, 2, 3, 4, 5, 6])).toBeNull()
+  })
+
+  it('rejects a polygon nested under a segmentation key', () => {
+    expect(resolveJsonSegmentation({ segmentation: [1, 2, 3, 4] })).toBeNull()
+  })
+
+  it('rejects garbage', () => {
+    expect(resolveJsonSegmentation(null)).toBeNull()
+    expect(resolveJsonSegmentation({})).toBeNull()
+    expect(resolveJsonSegmentation('not an object')).toBeNull()
+  })
+})
+
+describe('assembleCocoAnnotations', () => {
+  const rle = { size: [100, 100], counts: 'xyz' }
+
+  it('mints sequential image and category ids ordered by filename/name', () => {
+    const { images, categories } = assembleCocoAnnotations([
+      {
+        photoId: 'photo-b',
+        photoFilename: 'b.jpg',
+        category: 'shark',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '2',
+        segmentation: rle,
+        area: 10,
+        width: 100,
+        height: 100,
+      },
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: 'fish',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '1',
+        segmentation: rle,
+        area: 5,
+        width: 100,
+        height: 100,
+      },
+    ])
+
+    expect(images).toEqual([
+      { id: 1, file_name: 'a.jpg', width: 100, height: 100 },
+      { id: 2, file_name: 'b.jpg', width: 100, height: 100 },
+    ])
+    expect(categories).toEqual([
+      { id: 1, name: 'fish' },
+      { id: 2, name: 'shark' },
+    ])
+  })
+
+  it('builds annotation objects in the coco.json/seg_coco.json convention', () => {
+    const { annotations } = assembleCocoAnnotations([
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: 'fish',
+        bbox: [1, 2, 3, 4],
+        isCrowd: true,
+        manifestMaskId: '500',
+        segmentation: rle,
+        area: 42,
+        width: 100,
+        height: 100,
+      },
+    ])
+
+    expect(annotations).toEqual([
+      {
+        id: 500,
+        image_id: 1,
+        category_id: 1,
+        bbox: [1, 2, 3, 4],
+        area: 42,
+        iscrowd: 1,
+        segmentation: rle,
+      },
+    ])
+  })
+
+  it('keeps a non-numeric manifest id as a string rather than coercing to NaN', () => {
+    const { annotations } = assembleCocoAnnotations([
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: 'fish',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: 'not-numeric',
+        segmentation: rle,
+        area: 1,
+        width: 100,
+        height: 100,
+      },
+    ])
+    expect(annotations[0].id).toBe('not-numeric')
+  })
+
+  it('dedupes photos by photoId, keeping the first-seen width/height', () => {
+    const { images, annotations } = assembleCocoAnnotations([
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: 'fish',
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '1',
+        segmentation: rle,
+        area: 1,
+        width: 100,
+        height: 100,
+      },
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: 'fish',
+        bbox: [5, 5, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '2',
+        segmentation: rle,
+        area: 1,
+        width: 100,
+        height: 100,
+      },
+    ])
+    expect(images).toHaveLength(1)
+    expect(annotations).toHaveLength(2)
+    expect(annotations.every((a) => a.image_id === 1)).toBe(true)
+  })
+
+  it('falls back to "(uncategorized)" for a null category', () => {
+    const { categories, annotations } = assembleCocoAnnotations([
+      {
+        photoId: 'photo-a',
+        photoFilename: 'a.jpg',
+        category: null,
+        bbox: [0, 0, 1, 1],
+        isCrowd: false,
+        manifestMaskId: '1',
+        segmentation: rle,
+        area: 1,
+        width: 100,
+        height: 100,
+      },
+    ])
+    expect(categories).toEqual([{ id: 1, name: '(uncategorized)' }])
+    expect(annotations[0].category_id).toBe(1)
+  })
+})
+
+describe('correctedAnnotationsFilename', () => {
+  it('follows the {split}_corrected_{date}.json convention', () => {
+    expect(correctedAnnotationsFilename('val', new Date(2026, 8, 4))).toBe('val_corrected_2026-09-04.json')
+  })
+
+  it('labels the no-split bucket as "default"', () => {
+    expect(correctedAnnotationsFilename('(no split)', new Date(2026, 0, 5))).toBe(
+      'default_corrected_2026-01-05.json',
+    )
+  })
+})

@@ -4,6 +4,11 @@ import { supabase } from '../lib/supabaseClient'
 import { getSignedUrl } from '../lib/storage'
 import { collectPhotoMaskEntries, downloadZip } from '../lib/zipHelpers'
 import { exportRedoBatch, exportOverallPercent, exportPhaseLabel } from '../lib/exportRedo'
+import {
+  fetchCorrectedSplitCounts,
+  buildCorrectedAnnotationsForSplit,
+  correctedAnnotationsFilename,
+} from '../lib/exportAnnotations'
 import { listMembers, fetchMyRedoAssignments } from '../lib/projects'
 import { listPhotosForManagement, deletePhotosWithStorage, deleteProject } from '../lib/admin'
 import { selectAll } from '../lib/paging'
@@ -256,6 +261,8 @@ export default function Dashboard() {
 
       <AnnotatedExport projectId={projectId} projectName={project?.name} />
 
+      <CorrectedAnnotationsExport projectId={projectId} />
+
       {isOwner && (
         <>
           <ManagePhotos projectId={projectId} onChanged={loadCounts} />
@@ -374,6 +381,116 @@ function AnnotatedExport({ projectId, projectName }) {
               onClick={() => handleDownload(split)}
               disabled={downloadingSplit !== null}
               className="flex items-center gap-1.5 rounded-lg bg-[#639922] px-3.5 py-2 text-sm font-medium text-white disabled:opacity-50"
+            >
+              <i className="ti ti-download text-base" aria-hidden="true"></i>
+              {downloadingSplit === split
+                ? 'Building…'
+                : `${split === '(no split)' ? 'default' : split} (${count})`}
+            </button>
+          ))}
+      </div>
+      {progress && (
+        <ProgressBar
+          percent={progress.percent}
+          label={progress.label}
+          onCancel={() => controller?.abort()}
+        />
+      )}
+    </div>
+  )
+}
+
+// Downloads a single COCO-style annotations .json per split — bbox-only
+// annotations with an RLE `segmentation` appended, restricted to masks that
+// are `pass` or `fixed` (corrected), from every assignee. Unlike
+// AnnotatedExport above (which ships the raw photo/mask files), this is
+// just the annotation file itself, named `{split}_corrected_{date}.json`.
+function CorrectedAnnotationsExport({ projectId }) {
+  const { showError, showSuccess } = useToast()
+  const [splitCounts, setSplitCounts] = useState(null) // Map<split, count>
+  const [downloadingSplit, setDownloadingSplit] = useState(null)
+  const [progress, setProgress] = useState(null) // { percent, label }
+  const [controller, setController] = useState(null)
+
+  const load = useCallback(async () => {
+    try {
+      setSplitCounts(await fetchCorrectedSplitCounts(projectId))
+    } catch (e) {
+      console.error('fetchCorrectedSplitCounts failed:', e)
+      showError('Could not load the annotations export list.')
+    }
+  }, [projectId, showError])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  async function handleDownload(split) {
+    const abortController = new AbortController()
+    setController(abortController)
+    setDownloadingSplit(split)
+    setProgress({ percent: 0, label: 'Resolving segmentations…' })
+    try {
+      const { categories, images, annotations, skipped } = await buildCorrectedAnnotationsForSplit({
+        projectId,
+        split,
+        onProgress: (done, total) => {
+          setProgress({
+            percent: total ? (done / total) * 100 : 100,
+            label: `Resolving segmentations (${done}/${total})…`,
+          })
+        },
+        signal: abortController.signal,
+      })
+
+      const blob = new Blob([JSON.stringify({ categories, images, annotations })], {
+        type: 'application/json',
+      })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = correctedAnnotationsFilename(split)
+      a.click()
+      URL.revokeObjectURL(url)
+
+      showSuccess(
+        skipped.length > 0
+          ? `Downloaded ${annotations.length} annotation(s) — ${skipped.length} skipped (see console).`
+          : `Downloaded ${annotations.length} annotation(s).`,
+      )
+      if (skipped.length > 0) console.warn('CorrectedAnnotationsExport skipped:', skipped)
+    } catch (e) {
+      if (abortController.signal.aborted) {
+        showSuccess('Download cancelled.')
+      } else {
+        console.error('CorrectedAnnotationsExport download failed:', e)
+        showError('Could not build that split’s annotations file.')
+      }
+    } finally {
+      setDownloadingSplit(null)
+      setProgress(null)
+      setController(null)
+    }
+  }
+
+  if (splitCounts && splitCounts.size === 0) return null
+
+  return (
+    <div className="mt-6 rounded-xl border border-[#E5E4DF] p-4">
+      <p className="text-sm font-medium text-[#1a1a1a]">Corrected annotations (all assignees)</p>
+      <p className="mt-0.5 text-xs text-[#888780]">
+        One annotations.json per split — only "pass" and "fixed" (corrected) instances, segmentation
+        as COCO RLE.
+      </p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {splitCounts === null && <p className="text-sm text-[#888780]">Loading…</p>}
+        {splitCounts &&
+          [...splitCounts.entries()].map(([split, count]) => (
+            <button
+              key={split}
+              onClick={() => handleDownload(split)}
+              disabled={downloadingSplit !== null}
+              className="flex items-center gap-1.5 rounded-lg bg-[#3D6EB0] px-3.5 py-2 text-sm font-medium text-white disabled:opacity-50"
             >
               <i className="ti ti-download text-base" aria-hidden="true"></i>
               {downloadingSplit === split
