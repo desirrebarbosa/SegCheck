@@ -12,6 +12,8 @@ import Upload from './pages/Upload'
 import Dashboard from './pages/Dashboard'
 import Members from './pages/Members'
 import MyRedo from './pages/MyRedo'
+import Experiments from './pages/Experiments'
+import ExperimentDetail from './pages/ExperimentDetail'
 
 // Make sure a row exists in `reviewers` for the logged-in user, and keep the
 // email current (the email is how leads add this person to a project).
@@ -79,6 +81,8 @@ export default function App() {
             <Route path="upload" element={<Upload />} />
             <Route path="dashboard" element={<Dashboard />} />
             <Route path="members" element={<Members />} />
+            <Route path="experiments" element={<Experiments />} />
+            <Route path="experiments/:experimentId" element={<ExperimentDetail />} />
           </Route>
         </Routes>
         <div>

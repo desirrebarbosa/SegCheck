@@ -9,6 +9,7 @@ const links = [
   { to: 'upload', label: 'Upload', icon: 'ti-upload' },
   { to: 'dashboard', label: 'Dashboard', icon: 'ti-chart-bar' },
   { to: 'members', label: 'Members', icon: 'ti-users' },
+  { to: 'experiments', label: 'Experiments', icon: 'ti-flask' },
 ]
 
 export default function ProjectLayout({ session }) {
