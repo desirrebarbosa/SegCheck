@@ -15,6 +15,7 @@ import {
 } from '../lib/experimentImport'
 import { defaultChartConfig } from '../lib/runSeries'
 import { useToast } from '../components/Toast'
+import { useDialog } from '../components/Dialog'
 
 const MetricChart = lazy(() => import('../components/MetricChart'))
 
@@ -29,6 +30,7 @@ export default function ExperimentDetail() {
   const { isOwner } = useOutletContext()
   const { experimentId } = useParams()
   const { showError, showSuccess } = useToast()
+  const { confirm } = useDialog()
   const navigate = useNavigate()
 
   const [experiment, setExperiment] = useState(null) // null = loading
@@ -112,7 +114,14 @@ export default function ExperimentDetail() {
   }
 
   async function handleRemoveAttachment(a) {
-    if (!confirm(`Remove ${a.original_filename}?\n\nThe file is deleted from storage too.`))
+    if (
+      !(await confirm({
+        title: `Remove ${a.original_filename}?`,
+        message: 'The file is deleted from storage too.',
+        confirmLabel: 'Remove',
+        tone: 'danger',
+      }))
+    )
       return
     try {
       await removeAttachment(a)

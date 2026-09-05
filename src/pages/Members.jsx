@@ -10,10 +10,12 @@ import {
 import { relevelRedo, fetchOpenBatches } from '../lib/redoBatches'
 import { listModelFamilies, setModelFamily } from '../lib/experiments'
 import { useToast } from '../components/Toast'
+import { useDialog } from '../components/Dialog'
 
 export default function Members() {
   const { projectId, project, isLead, isOwner } = useOutletContext()
   const { showError, showSuccess } = useToast()
+  const { confirm, promptText } = useDialog()
   const [members, setMembers] = useState(null)
   const [progress, setProgress] = useState(null) // keyed by reviewer id
   const [openBatches, setOpenBatches] = useState({}) // reviewer id -> open batch
@@ -105,12 +107,14 @@ export default function Members() {
   // queue, so they are topped up to the same total as everyone else.
   async function handleRelevel() {
     if (
-      !confirm(
-        'Re-level the redo backlog?\n\n' +
+      !(await confirm({
+        title: 'Re-level the redo backlog?',
+        message:
           'Work that has been downloaded stays with whoever has it. Everything ' +
           'else is released and re-split so every member ends up with the same ' +
           'total — including anyone mid-batch, who is topped up to match.',
-      )
+        confirmLabel: 'Re-level',
+      }))
     )
       return
     setBusy(true)
@@ -136,7 +140,16 @@ export default function Members() {
   // is what the filter pills on the Experiments page are built from, and the
   // unique index behind it means one family belongs to exactly one member.
   async function handleFamily(reviewerId, current) {
-    const next = prompt('Model family for this member (blank to clear):', current ?? '')
+    const next = await promptText({
+      title: 'Model family',
+      message:
+        'One family per member — it is what the filter pills on Experiments are ' +
+        'built from. Leave it blank to clear it.',
+      label: 'Model family',
+      defaultValue: current ?? '',
+      placeholder: 'MantaNet',
+      allowEmpty: true,
+    })
     if (next === null) return
     try {
       await setModelFamily(projectId, reviewerId, next)
@@ -152,7 +165,17 @@ export default function Members() {
       showError('The project owner can\u2019t be removed from the project.')
       return
     }
-    if (!confirm(`Remove ${label} from this project?`)) return
+    if (
+      !(await confirm({
+        title: `Remove ${label} from this project?`,
+        message:
+          'Anything still assigned to them is released and redistributed across the ' +
+          'remaining members.',
+        confirmLabel: 'Remove',
+        tone: 'danger',
+      }))
+    )
+      return
     try {
       const { assigned } = await removeMember(projectId, reviewerId)
       await refresh()

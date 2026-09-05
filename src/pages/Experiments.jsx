@@ -9,6 +9,7 @@ import {
 } from '../lib/experiments'
 import { TASK_LABELS } from '../lib/experimentImport'
 import { useToast } from '../components/Toast'
+import { useDialog } from '../components/Dialog'
 
 // Column widths for the list. One string, used by both the header and the
 // rows, so they cannot drift apart. Below md the grid collapses to one column
@@ -19,6 +20,7 @@ const GRID =
 export default function Experiments() {
   const { projectId, isLead, isOwner } = useOutletContext()
   const { showError, showSuccess } = useToast()
+  const { confirm, promptText } = useDialog()
 
   const [rows, setRows] = useState(null) // null = loading
   const [families, setFamilies] = useState([])
@@ -72,11 +74,13 @@ export default function Experiments() {
     const on = !row.archived_at
     if (
       on &&
-      !confirm(
-        `Archive ${row.title}?\n\n` +
+      !(await confirm({
+        title: `Archive ${row.title}?`,
+        message:
           'It leaves the list but nothing is deleted — the run log, the chart and any ' +
           'attachments stay exactly as they are, and "Show archived" brings it back.',
-      )
+        confirmLabel: 'Archive',
+      }))
     )
       return
     try {
@@ -90,11 +94,14 @@ export default function Experiments() {
 
   async function handleDelete(row) {
     if (
-      !confirm(
-        `Delete ${row.title}?\n\n` +
+      !(await confirm({
+        title: `Delete ${row.title}?`,
+        message:
           'This removes the experiment, its whole run log and every attached file. ' +
           'It cannot be undone — archive it instead if you only want it out of the way.',
-      )
+        confirmLabel: 'Delete',
+        tone: 'danger',
+      }))
     )
       return
     try {
@@ -107,7 +114,16 @@ export default function Experiments() {
   }
 
   async function handleRename(reviewerId, current) {
-    const next = prompt('Model family for this member (blank to clear):', current ?? '')
+    const next = await promptText({
+      title: 'Model family',
+      message:
+        'One family per member — it is what the filter pills on Experiments are ' +
+        'built from. Leave it blank to clear it.',
+      label: 'Model family',
+      defaultValue: current ?? '',
+      placeholder: 'MantaNet',
+      allowEmpty: true,
+    })
     if (next === null) return
     try {
       await setModelFamily(projectId, reviewerId, next)
