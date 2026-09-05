@@ -14,6 +14,7 @@ import Members from './pages/Members'
 import MyRedo from './pages/MyRedo'
 import Experiments from './pages/Experiments'
 import ExperimentDetail from './pages/ExperimentDetail'
+import ExperimentForm from './pages/ExperimentForm'
 
 // Make sure a row exists in `reviewers` for the logged-in user, and keep the
 // email current (the email is how leads add this person to a project).
@@ -82,7 +83,11 @@ export default function App() {
             <Route path="dashboard" element={<Dashboard />} />
             <Route path="members" element={<Members />} />
             <Route path="experiments" element={<Experiments />} />
+            {/* `new` is a static segment, so React Router ranks it above
+                `:experimentId` no matter what order these appear in. */}
+            <Route path="experiments/new" element={<ExperimentForm />} />
             <Route path="experiments/:experimentId" element={<ExperimentDetail />} />
+            <Route path="experiments/:experimentId/edit" element={<ExperimentForm />} />
           </Route>
         </Routes>
         <div>

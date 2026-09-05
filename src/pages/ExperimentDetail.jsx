@@ -259,7 +259,7 @@ export default function ExperimentDetail() {
 
       <div className="no-print mx-auto mt-4 flex max-w-3xl flex-wrap justify-end gap-2">
         <button
-          onClick={() => navigate('..', { relative: 'path', state: { editId: experiment.id } })}
+          onClick={() => navigate('edit')}
           className="rounded-lg bg-[#1a1a1a] px-4 py-2 text-sm font-medium text-white"
         >
           Edit
