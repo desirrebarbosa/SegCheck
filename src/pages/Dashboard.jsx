@@ -13,6 +13,7 @@ import { listMembers, fetchMyRedoAssignments } from '../lib/projects'
 import { listPhotosForManagement, deletePhotosWithStorage, deleteProject } from '../lib/admin'
 import { selectAll } from '../lib/paging'
 import ProgressBar from '../components/ProgressBar'
+import WeeklyLeaderboard from '../components/WeeklyLeaderboard'
 import { useToast } from '../components/Toast'
 import { useDialog } from '../components/Dialog'
 
@@ -218,6 +219,10 @@ export default function Dashboard() {
           <Stat label="Total complete" value={counts.pass + counts.fixed} tone="success" />
         </div>
       )}
+
+      <div className="mt-5">
+        <WeeklyLeaderboard projectId={projectId} />
+      </div>
 
       <div className="mt-5 flex flex-wrap gap-2">
         <button
