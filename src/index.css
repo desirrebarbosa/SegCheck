@@ -1,1 +1,40 @@
 @import "tailwindcss";
+
+/* Print layout, used by the Print button on an experiment's page.
+   Everything that isn't the experiment card is dropped — the sidebar, the
+   action buttons, the toast stack — and the card is unconstrained so the
+   chart gets the full page width. print-color-adjust keeps the chart lines
+   and stat backgrounds, which browsers otherwise strip to save ink. */
+@media print {
+  aside,
+  .no-print {
+    display: none !important;
+  }
+
+  main {
+    padding: 0 !important;
+  }
+
+  /* On paper the card's border, rounding and padding are just chrome around
+     a page that already has margins — strip them so the experiment prints as
+     a plain document rather than a screenshot of a card. */
+  .print-card {
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+  }
+
+  /* Keep a section and its heading together across a page break. */
+  .print-card section,
+  .print-card figure {
+    break-inside: avoid;
+  }
+
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}

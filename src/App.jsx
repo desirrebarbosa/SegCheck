@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { supabase } from './lib/supabaseClient'
 import { useSession } from './auth/useSession'
 import { ToastProvider } from './components/Toast'
+import { DialogProvider } from './components/Dialog'
 import { Analytics } from '@vercel/analytics/react';
 import Login from './pages/Login'
 import ProjectsList from './pages/ProjectsList'
@@ -12,6 +13,9 @@ import Upload from './pages/Upload'
 import Dashboard from './pages/Dashboard'
 import Members from './pages/Members'
 import MyRedo from './pages/MyRedo'
+import Experiments from './pages/Experiments'
+import ExperimentDetail from './pages/ExperimentDetail'
+import ExperimentForm from './pages/ExperimentForm'
 
 // Make sure a row exists in `reviewers` for the logged-in user, and keep the
 // email current (the email is how leads add this person to a project).
@@ -67,25 +71,33 @@ export default function App() {
 
   return (
     <ToastProvider>
-      <BrowserRouter>
-        <Routes>
-          {/* Landing: pick or create a project */}
-          <Route path="/" element={<ProjectsList session={session} />} />
+      <DialogProvider>
+        <BrowserRouter>
+          <Routes>
+            {/* Landing: pick or create a project */}
+            <Route path="/" element={<ProjectsList session={session} />} />
 
-          {/* Everything inside a project is scoped by :projectId */}
-          <Route path="/projects/:projectId" element={<ProjectLayout session={session} />}>
-            <Route index element={<ReviewQueue />} />
-            <Route path="my-redo" element={<MyRedo />} />
-            <Route path="upload" element={<Upload />} />
-            <Route path="dashboard" element={<Dashboard />} />
-            <Route path="members" element={<Members />} />
-          </Route>
-        </Routes>
-        <div>
-          {/* ... */}
-          <Analytics />
-        </div>
-      </BrowserRouter>
+            {/* Everything inside a project is scoped by :projectId */}
+            <Route path="/projects/:projectId" element={<ProjectLayout session={session} />}>
+              <Route index element={<ReviewQueue />} />
+              <Route path="my-redo" element={<MyRedo />} />
+              <Route path="upload" element={<Upload />} />
+              <Route path="dashboard" element={<Dashboard />} />
+              <Route path="members" element={<Members />} />
+              <Route path="experiments" element={<Experiments />} />
+              {/* `new` is a static segment, so React Router ranks it above
+                  `:experimentId` no matter what order these appear in. */}
+              <Route path="experiments/new" element={<ExperimentForm />} />
+              <Route path="experiments/:experimentId" element={<ExperimentDetail />} />
+              <Route path="experiments/:experimentId/edit" element={<ExperimentForm />} />
+            </Route>
+          </Routes>
+          <div>
+            {/* ... */}
+            <Analytics />
+          </div>
+        </BrowserRouter>
+      </DialogProvider>
     </ToastProvider>
   )
 }

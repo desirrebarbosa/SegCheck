@@ -14,6 +14,7 @@ import { listPhotosForManagement, deletePhotosWithStorage, deleteProject } from 
 import { selectAll } from '../lib/paging'
 import ProgressBar from '../components/ProgressBar'
 import { useToast } from '../components/Toast'
+import { useDialog } from '../components/Dialog'
 
 // Count-only queries (head: true) instead of fetching every active_masks
 // row just to tally them — cheap regardless of project size. Full rows are
@@ -516,6 +517,7 @@ function CorrectedAnnotationsExport({ projectId }) {
 // through the Storage API via lib/admin.js.
 function ManagePhotos({ projectId, onChanged }) {
   const { showError, showSuccess } = useToast()
+  const { confirm } = useDialog()
   const [open, setOpen] = useState(false)
   const [page, setPage] = useState(0)
   const [result, setResult] = useState(null) // { photos, total, page, pageSize }
@@ -563,7 +565,13 @@ function ManagePhotos({ projectId, onChanged }) {
     const chosen = result.photos.filter((p) => selected.has(p.photo_id))
     if (chosen.length === 0) return
     if (
-      !confirm(`Delete ${chosen.length} photo(s) and all their masks/files? This can't be undone.`)
+      !(await confirm({
+        title: `Delete ${chosen.length} photo(s)?`,
+        message:
+          'Their masks, versions and stored files go too. This cannot be undone.',
+        confirmLabel: 'Delete',
+        tone: 'danger',
+      }))
     )
       return
     setBusy(true)
@@ -686,13 +694,19 @@ function ManagePhotos({ projectId, onChanged }) {
 // under its path prefix (explicit — Storage isn't cascade-cleaned by the DB).
 function DangerZone({ projectId, projectName, onDeleted }) {
   const { showError } = useToast()
+  const { confirm } = useDialog()
   const [busy, setBusy] = useState(false)
 
   async function handleDelete() {
     if (
-      !confirm(
-        `Permanently delete "${projectName}" — all photos, masks, review history, and files? This cannot be undone.`,
-      )
+      !(await confirm({
+        title: `Permanently delete "${projectName}"?`,
+        message:
+          'All photos, masks, review history and stored files are removed. ' +
+          'This cannot be undone.',
+        confirmLabel: 'Delete project',
+        tone: 'danger',
+      }))
     )
       return
     setBusy(true)

@@ -8,14 +8,18 @@ import {
   rebalanceAllAssignments,
 } from '../lib/projects'
 import { relevelRedo, fetchOpenBatches } from '../lib/redoBatches'
+import { listModelFamilies, setModelFamily } from '../lib/experiments'
 import { useToast } from '../components/Toast'
+import { useDialog } from '../components/Dialog'
 
 export default function Members() {
-  const { projectId, project, isOwner } = useOutletContext()
+  const { projectId, project, isLead, isOwner } = useOutletContext()
   const { showError, showSuccess } = useToast()
+  const { confirm, promptText } = useDialog()
   const [members, setMembers] = useState(null)
   const [progress, setProgress] = useState(null) // keyed by reviewer id
   const [openBatches, setOpenBatches] = useState({}) // reviewer id -> open batch
+  const [families, setFamilies] = useState({}) // reviewer id -> model family
   const [email, setEmail] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -34,15 +38,17 @@ export default function Members() {
       return
     }
     try {
-      const [prog, batches] = await Promise.all([
+      const [prog, batches, roles] = await Promise.all([
         fetchMemberProgress(
           projectId,
           roster.map((m) => m.reviewer.id),
         ),
         fetchOpenBatches(projectId),
+        listModelFamilies(projectId),
       ])
       setProgress(prog)
       setOpenBatches(batches)
+      setFamilies(Object.fromEntries(roles.map((r) => [r.reviewerId, r.modelFamily])))
     } catch (e) {
       console.error('fetchMemberProgress failed:', e)
       showError('Could not load member progress.')
@@ -101,12 +107,14 @@ export default function Members() {
   // queue, so they are topped up to the same total as everyone else.
   async function handleRelevel() {
     if (
-      !confirm(
-        'Re-level the redo backlog?\n\n' +
+      !(await confirm({
+        title: 'Re-level the redo backlog?',
+        message:
           'Work that has been downloaded stays with whoever has it. Everything ' +
           'else is released and re-split so every member ends up with the same ' +
           'total — including anyone mid-batch, who is topped up to match.',
-      )
+        confirmLabel: 'Re-level',
+      }))
     )
       return
     setBusy(true)
@@ -128,12 +136,46 @@ export default function Members() {
     }
   }
 
+  // The model family this member owns — MantaNet, MarineNet, SeaBedNet. It
+  // is what the filter pills on the Experiments page are built from, and the
+  // unique index behind it means one family belongs to exactly one member.
+  async function handleFamily(reviewerId, current) {
+    const next = await promptText({
+      title: 'Model family',
+      message:
+        'One family per member — it is what the filter pills on Experiments are ' +
+        'built from. Leave it blank to clear it.',
+      label: 'Model family',
+      defaultValue: current ?? '',
+      placeholder: 'MantaNet',
+      allowEmpty: true,
+    })
+    if (next === null) return
+    try {
+      await setModelFamily(projectId, reviewerId, next)
+      await refresh()
+      showSuccess('Model family updated.')
+    } catch (e) {
+      showError(e.message)
+    }
+  }
+
   async function handleRemove(reviewerId, label) {
     if (reviewerId === project?.owner_id) {
       showError('The project owner can\u2019t be removed from the project.')
       return
     }
-    if (!confirm(`Remove ${label} from this project?`)) return
+    if (
+      !(await confirm({
+        title: `Remove ${label} from this project?`,
+        message:
+          'Anything still assigned to them is released and redistributed across the ' +
+          'remaining members.',
+        confirmLabel: 'Remove',
+        tone: 'danger',
+      }))
+    )
+      return
     try {
       const { assigned } = await removeMember(projectId, reviewerId)
       await refresh()
@@ -202,6 +244,21 @@ export default function Members() {
             <div className="min-w-0">
               <p className="truncate text-sm">{m.reviewer.display_name || m.reviewer.email}</p>
               <p className="truncate text-xs text-[#888780]">{m.reviewer.email}</p>
+              <p className="mt-0.5 flex items-center gap-1.5 text-xs">
+                <span className="text-[#888780]">Model family</span>
+                <span className={families[m.reviewer.id] ? 'text-[#5F5E5A]' : 'text-[#B4B2A9]'}>
+                  {families[m.reviewer.id] || 'not set'}
+                </span>
+                {isLead && (
+                  <button
+                    onClick={() => handleFamily(m.reviewer.id, families[m.reviewer.id])}
+                    aria-label={`Set model family for ${m.reviewer.email}`}
+                    className="text-[#B4B2A9] hover:text-[#5F5E5A]"
+                  >
+                    <i className="ti ti-pencil text-xs" aria-hidden="true"></i>
+                  </button>
+                )}
+              </p>
               <MemberProgress p={progress?.[m.reviewer.id]} loading={progress === null} />
               {openBatches[m.reviewer.id] && (
                 <p className="mt-1 inline-flex items-center gap-1.5 rounded-lg bg-[#FDF3E7] px-2 py-0.5 text-xs text-[#7A4A12]">
