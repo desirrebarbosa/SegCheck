@@ -311,11 +311,11 @@ export default function MyRedo() {
         <p className="mt-6 text-sm text-[#888780]">Nothing assigned to you right now.</p>
       )}
 
-      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+      {/* <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
         {items?.map((item) => (
           <RedoItemCard key={item.id} item={item} />
         ))}
-      </div>
+      </div> */}
     </section>
   )
 }
