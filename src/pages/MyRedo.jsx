@@ -49,7 +49,7 @@ export default function MyRedo() {
   const [uploadProgress, setUploadProgress] = useState(null)
   const [uploadController, setUploadController] = useState(null)
   const [preflightErrors, setPreflightErrors] = useState(null) // string[] | null
-  const [uploadResult, setUploadResult] = useState(null) // { fixed, duplicate } | null
+  const [uploadResult, setUploadResult] = useState(null) // { fixed, duplicate, skipped } | null
   const fileInputRef = useRef(null)
 
   useEffect(() => {
@@ -150,7 +150,7 @@ export default function MyRedo() {
       if (!result.ok) {
         setPreflightErrors(result.errors)
       } else {
-        setUploadResult({ fixed: result.fixed, duplicate: result.duplicate })
+        setUploadResult({ fixed: result.fixed, duplicate: result.duplicate, skipped: result.skipped })
         // Refresh the redo list so fixed masks disappear, and the count so
         // it reflects what just got submitted.
         const [rows, count] = await Promise.all([
@@ -278,6 +278,25 @@ export default function MyRedo() {
               {uploadResult.duplicate} already recorded (idempotent re-upload).
             </p>
           )}
+        </div>
+      )}
+
+      {/* ── Skipped files (not rejected, just unrecognized) ── */}
+      {uploadResult?.skipped?.length > 0 && (
+        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
+          <p className="mb-2 text-sm font-medium text-amber-800">
+            {uploadResult.skipped.length} file{uploadResult.skipped.length !== 1 ? 's' : ''} in the
+            ZIP {uploadResult.skipped.length !== 1 ? "weren't" : "wasn't"} listed in this batch's
+            manifest.csv, so {uploadResult.skipped.length !== 1 ? 'they were' : 'it was'} left
+            alone — everything else still got submitted. This usually means the mask wasn't part
+            of the batch you downloaded (e.g. it wasn't flagged for redo yet). Download a fresh
+            redo batch to pick it up, or check the filename against your manifest.
+          </p>
+          <ul className="list-inside list-disc space-y-1 text-xs text-amber-700">
+            {uploadResult.skipped.map((path, i) => (
+              <li key={i}>{path}</li>
+            ))}
+          </ul>
         </div>
       )}
 

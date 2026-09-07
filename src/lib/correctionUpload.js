@@ -137,10 +137,15 @@ const FORMAT_BY_EXT = { png: 'png', json: 'coco_json' }
 // Rejection reasons (from spec):
 //   - Missing corrections
 //   - Duplicate mask IDs
-//   - Unknown or extra files
 //   - Wrong-project manifests  (checked by caller with the project context)
 //   - Unsupported file formats
 //   - Unsafe ZIP paths  (path traversal)
+//
+// Unknown/extra files (not listed in manifest.csv, e.g. corrections for
+// instance_ids that weren't part of THIS exported batch) are NOT a rejection
+// reason — see the "Extra / unknown files" section below. They're reported
+// back as `skipped` instead, so a batch isn't blocked just because it also
+// contains files the importer can't place.
 export function preflightCorrectionZip({ manifestRows, entries, expectedProjectId }) {
   const errors = []
 
@@ -204,15 +209,25 @@ export function preflightCorrectionZip({ manifestRows, entries, expectedProjectI
   // --- Extra / unknown files in the ZIP ---
   // Skip photo/mask/preview folders — those are reference copies, not
   // corrections, so we don't require them to be listed in the manifest.
+  //
+  // Anything else that isn't accounted for (e.g. a corrected mask the
+  // reviewer added for an instance_id that wasn't in THIS exported batch,
+  // because it wasn't flagged for redo yet when the batch was downloaded)
+  // is skipped rather than rejected. A file the importer doesn't recognize
+  // shouldn't block every other correction in the same upload — the caller
+  // surfaces `skipped` so the reviewer can tell what didn't go through and
+  // why (usually: re-export a batch that includes those instances, or wait
+  // for them to be flagged).
   const IGNORED_PREFIXES = ['photos/', 'masks/', 'previews/']
+  const skipped = []
   for (const path of byPath.keys()) {
     if (accountedPaths.has(path)) continue
     if (IGNORED_PREFIXES.some((p) => path.startsWith(p))) continue
-    errors.push(`Unknown file in ZIP (not listed in manifest): "${path}".`)
+    skipped.push(path)
   }
 
-  if (errors.length > 0) return { ok: false, errors }
-  return { ok: true, items }
+  if (errors.length > 0) return { ok: false, errors, skipped }
+  return { ok: true, items, skipped }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,8 +298,11 @@ async function callSubmitCorrectionsRpc({ projectId, batchId, userId, correction
 // `signal`       — optional AbortSignal for cancellation
 //
 // Returns:
-//   { ok: false, errors }                   — preflight rejected
-//   { ok: true,  fixed, duplicate }         — all corrections recorded (or already existed)
+//   { ok: false, errors, skipped }                    — preflight rejected
+//   { ok: true,  fixed, duplicate, skipped }          — corrections recorded (or already existed);
+//                                                        `skipped` lists any ZIP files that were
+//                                                        neither a recognized correction nor a
+//                                                        reference file, and so were left alone.
 //
 // Throws on unrecoverable network/database errors.
 export async function uploadCorrectionZip({ zipFile, projectId, userId, onProgress, signal }) {
@@ -297,13 +315,13 @@ export async function uploadCorrectionZip({ zipFile, projectId, userId, onProgre
     (e) => e.name === 'manifest.csv' || e.relativePath === 'manifest.csv',
   )
   if (!manifestEntry) {
-    return { ok: false, errors: ['manifest.csv not found in the ZIP.'] }
+    return { ok: false, errors: ['manifest.csv not found in the ZIP.'], skipped: [] }
   }
   let parsed
   try {
     parsed = parseCorrectionManifest(await manifestEntry.blob.text())
   } catch (e) {
-    return { ok: false, errors: [e.message] }
+    return { ok: false, errors: [e.message], skipped: [] }
   }
 
   // ── 3. Preflight validation (pure, no network) ──────────────────────────
@@ -312,9 +330,10 @@ export async function uploadCorrectionZip({ zipFile, projectId, userId, onProgre
     entries,
     expectedProjectId: projectId,
   })
-  if (!preflight.ok) return { ok: false, errors: preflight.errors }
+  if (!preflight.ok) return { ok: false, errors: preflight.errors, skipped: preflight.skipped }
 
   const items = preflight.items // [{ instanceId, correctionPath, format, blob, originalFilename }]
+  const skipped = preflight.skipped // string[] — ZIP paths the importer didn't recognize
   onProgress?.({ phase: 'parse', done: 1, total: 1 })
 
   // ── 4. Compute checksums (parallel, cheap) ──────────────────────────────
@@ -389,5 +408,10 @@ export async function uploadCorrectionZip({ zipFile, projectId, userId, onProgre
 
   // The RPC returns { fixed, duplicate } — fixed = newly recorded,
   // duplicate = already existed (idempotent re-upload detected by checksum).
-  return { ok: true, fixed: rpcResult?.fixed ?? 0, duplicate: rpcResult?.duplicate ?? 0 }
+  return {
+    ok: true,
+    fixed: rpcResult?.fixed ?? 0,
+    duplicate: rpcResult?.duplicate ?? 0,
+    skipped,
+  }
 }
