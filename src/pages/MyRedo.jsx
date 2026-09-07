@@ -320,74 +320,74 @@ export default function MyRedo() {
   )
 }
 
-function RedoItemCard({ item }) {
-  const { showError } = useToast()
-  const [thumbUrl, setThumbUrl] = useState(null)
-  const [guide, setGuide] = useState(null) // { guide_type, image_url }
-  const [guideBusy, setGuideBusy] = useState(false)
+// function RedoItemCard({ item }) {
+//   const { showError } = useToast()
+//   const [thumbUrl, setThumbUrl] = useState(null)
+//   const [guide, setGuide] = useState(null) // { guide_type, image_url }
+//   const [guideBusy, setGuideBusy] = useState(false)
 
-  useEffect(() => {
-    let alive = true
-    getSignedUrl(item.photo_storage_path)
-      .then((url) => alive && setThumbUrl(url))
-      .catch((e) => console.error('getSignedUrl failed:', e))
-    return () => {
-      alive = false
-    }
-  }, [item.photo_storage_path])
+//   useEffect(() => {
+//     let alive = true
+//     getSignedUrl(item.photo_storage_path)
+//       .then((url) => alive && setThumbUrl(url))
+//       .catch((e) => console.error('getSignedUrl failed:', e))
+//     return () => {
+//       alive = false
+//     }
+//   }, [item.photo_storage_path])
 
-  async function loadGuide() {
-    setGuideBusy(true)
-    try {
-      const photoUrl = thumbUrl ?? (await getSignedUrl(item.photo_storage_path))
-      const maskUrl = item.storage_path ? await getSignedUrl(item.storage_path) : null
-      const result = await fetchGuide({
-        maskUrl,
-        photoUrl,
-        bbox: item.bbox,
-        category: item.category,
-      })
-      setGuide(result)
-    } catch (e) {
-      showError(e.message)
-    } finally {
-      setGuideBusy(false)
-    }
-  }
+//   async function loadGuide() {
+//     setGuideBusy(true)
+//     try {
+//       const photoUrl = thumbUrl ?? (await getSignedUrl(item.photo_storage_path))
+//       const maskUrl = item.storage_path ? await getSignedUrl(item.storage_path) : null
+//       const result = await fetchGuide({
+//         maskUrl,
+//         photoUrl,
+//         bbox: item.bbox,
+//         category: item.category,
+//       })
+//       setGuide(result)
+//     } catch (e) {
+//       showError(e.message)
+//     } finally {
+//       setGuideBusy(false)
+//     }
+//   }
 
-  return (
-    <div className="rounded-xl border border-[#E5E4DF] p-3">
-      <div className="mb-2 flex items-center justify-between">
-        <span className="truncate text-sm font-medium">{item.photo_filename}</span>
-        {item.category && (
-          <span className="rounded-lg bg-[#F1EFE8] px-2 py-0.5 text-xs text-[#5F5E5A]">
-            {item.category}
-          </span>
-        )}
-      </div>
+//   return (
+//     <div className="rounded-xl border border-[#E5E4DF] p-3">
+//       <div className="mb-2 flex items-center justify-between">
+//         <span className="truncate text-sm font-medium">{item.photo_filename}</span>
+//         {item.category && (
+//           <span className="rounded-lg bg-[#F1EFE8] px-2 py-0.5 text-xs text-[#5F5E5A]">
+//             {item.category}
+//           </span>
+//         )}
+//       </div>
 
-      {thumbUrl ? (
-        <img src={thumbUrl} alt="" className="mb-2 h-32 w-full rounded-lg object-cover" />
-      ) : (
-        <div className="mb-2 h-32 w-full rounded-lg bg-[#F1EFE8]" />
-      )}
+//       {thumbUrl ? (
+//         <img src={thumbUrl} alt="" className="mb-2 h-32 w-full rounded-lg object-cover" />
+//       ) : (
+//         <div className="mb-2 h-32 w-full rounded-lg bg-[#F1EFE8]" />
+//       )}
 
-      {guide ? (
-        <div className="space-y-1">
-          <p className="text-xs text-[#888780]">
-            Guide: <span className="font-medium text-[#1a1a1a]">{guide.guide_type}</span>
-          </p>
-          <img src={guide.image_url} alt="Annotation guide" className="w-full rounded-lg" />
-        </div>
-      ) : (
-        <button
-          onClick={loadGuide}
-          disabled={guideBusy || !isGuideApiConfigured()}
-          className="w-full rounded-lg border border-[#B4B2A9] py-1.5 text-xs disabled:opacity-40"
-        >
-          {guideBusy ? 'Loading guide…' : 'Load guide'}
-        </button>
-      )}
-    </div>
-  )
-}
+//       {guide ? (
+//         <div className="space-y-1">
+//           <p className="text-xs text-[#888780]">
+//             Guide: <span className="font-medium text-[#1a1a1a]">{guide.guide_type}</span>
+//           </p>
+//           <img src={guide.image_url} alt="Annotation guide" className="w-full rounded-lg" />
+//         </div>
+//       ) : (
+//         <button
+//           onClick={loadGuide}
+//           disabled={guideBusy || !isGuideApiConfigured()}
+//           className="w-full rounded-lg border border-[#B4B2A9] py-1.5 text-xs disabled:opacity-40"
+//         >
+//           {guideBusy ? 'Loading guide…' : 'Load guide'}
+//         </button>
+//       )}
+//     </div>
+//   )
+// }
