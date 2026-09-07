@@ -49,7 +49,7 @@ export default function MyRedo() {
   const [uploadProgress, setUploadProgress] = useState(null)
   const [uploadController, setUploadController] = useState(null)
   const [preflightErrors, setPreflightErrors] = useState(null) // string[] | null
-  const [uploadResult, setUploadResult] = useState(null) // { fixed, duplicate } | null
+  const [uploadResult, setUploadResult] = useState(null) // { fixed, duplicate, skipped } | null
   const fileInputRef = useRef(null)
 
   useEffect(() => {
@@ -150,7 +150,7 @@ export default function MyRedo() {
       if (!result.ok) {
         setPreflightErrors(result.errors)
       } else {
-        setUploadResult({ fixed: result.fixed, duplicate: result.duplicate })
+        setUploadResult({ fixed: result.fixed, duplicate: result.duplicate, skipped: result.skipped })
         // Refresh the redo list so fixed masks disappear, and the count so
         // it reflects what just got submitted.
         const [rows, count] = await Promise.all([
@@ -281,6 +281,25 @@ export default function MyRedo() {
         </div>
       )}
 
+      {/* ── Skipped files (not rejected, just unrecognized) ── */}
+      {uploadResult?.skipped?.length > 0 && (
+        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
+          <p className="mb-2 text-sm font-medium text-amber-800">
+            {uploadResult.skipped.length} file{uploadResult.skipped.length !== 1 ? 's' : ''} in the
+            ZIP {uploadResult.skipped.length !== 1 ? "weren't" : "wasn't"} listed in this batch's
+            manifest.csv, so {uploadResult.skipped.length !== 1 ? 'they were' : 'it was'} left
+            alone — everything else still got submitted. This usually means the mask wasn't part
+            of the batch you downloaded (e.g. it wasn't flagged for redo yet). Download a fresh
+            redo batch to pick it up, or check the filename against your manifest.
+          </p>
+          <ul className="list-inside list-disc space-y-1 text-xs text-amber-700">
+            {uploadResult.skipped.map((path, i) => (
+              <li key={i}>{path}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {!isGuideApiConfigured() && (
         <p className="mt-3 rounded-lg bg-[#F1EFE8] px-3 py-2 text-xs text-[#5F5E5A]">
           We are working on it.
@@ -292,83 +311,83 @@ export default function MyRedo() {
         <p className="mt-6 text-sm text-[#888780]">Nothing assigned to you right now.</p>
       )}
 
-      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+      {/* <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
         {items?.map((item) => (
           <RedoItemCard key={item.id} item={item} />
         ))}
-      </div>
+      </div> */}
     </section>
   )
 }
 
-function RedoItemCard({ item }) {
-  const { showError } = useToast()
-  const [thumbUrl, setThumbUrl] = useState(null)
-  const [guide, setGuide] = useState(null) // { guide_type, image_url }
-  const [guideBusy, setGuideBusy] = useState(false)
+// function RedoItemCard({ item }) {
+//   const { showError } = useToast()
+//   const [thumbUrl, setThumbUrl] = useState(null)
+//   const [guide, setGuide] = useState(null) // { guide_type, image_url }
+//   const [guideBusy, setGuideBusy] = useState(false)
 
-  useEffect(() => {
-    let alive = true
-    getSignedUrl(item.photo_storage_path)
-      .then((url) => alive && setThumbUrl(url))
-      .catch((e) => console.error('getSignedUrl failed:', e))
-    return () => {
-      alive = false
-    }
-  }, [item.photo_storage_path])
+//   useEffect(() => {
+//     let alive = true
+//     getSignedUrl(item.photo_storage_path)
+//       .then((url) => alive && setThumbUrl(url))
+//       .catch((e) => console.error('getSignedUrl failed:', e))
+//     return () => {
+//       alive = false
+//     }
+//   }, [item.photo_storage_path])
 
-  async function loadGuide() {
-    setGuideBusy(true)
-    try {
-      const photoUrl = thumbUrl ?? (await getSignedUrl(item.photo_storage_path))
-      const maskUrl = item.storage_path ? await getSignedUrl(item.storage_path) : null
-      const result = await fetchGuide({
-        maskUrl,
-        photoUrl,
-        bbox: item.bbox,
-        category: item.category,
-      })
-      setGuide(result)
-    } catch (e) {
-      showError(e.message)
-    } finally {
-      setGuideBusy(false)
-    }
-  }
+//   async function loadGuide() {
+//     setGuideBusy(true)
+//     try {
+//       const photoUrl = thumbUrl ?? (await getSignedUrl(item.photo_storage_path))
+//       const maskUrl = item.storage_path ? await getSignedUrl(item.storage_path) : null
+//       const result = await fetchGuide({
+//         maskUrl,
+//         photoUrl,
+//         bbox: item.bbox,
+//         category: item.category,
+//       })
+//       setGuide(result)
+//     } catch (e) {
+//       showError(e.message)
+//     } finally {
+//       setGuideBusy(false)
+//     }
+//   }
 
-  return (
-    <div className="rounded-xl border border-[#E5E4DF] p-3">
-      <div className="mb-2 flex items-center justify-between">
-        <span className="truncate text-sm font-medium">{item.photo_filename}</span>
-        {item.category && (
-          <span className="rounded-lg bg-[#F1EFE8] px-2 py-0.5 text-xs text-[#5F5E5A]">
-            {item.category}
-          </span>
-        )}
-      </div>
+//   return (
+//     <div className="rounded-xl border border-[#E5E4DF] p-3">
+//       <div className="mb-2 flex items-center justify-between">
+//         <span className="truncate text-sm font-medium">{item.photo_filename}</span>
+//         {item.category && (
+//           <span className="rounded-lg bg-[#F1EFE8] px-2 py-0.5 text-xs text-[#5F5E5A]">
+//             {item.category}
+//           </span>
+//         )}
+//       </div>
 
-      {thumbUrl ? (
-        <img src={thumbUrl} alt="" className="mb-2 h-32 w-full rounded-lg object-cover" />
-      ) : (
-        <div className="mb-2 h-32 w-full rounded-lg bg-[#F1EFE8]" />
-      )}
+//       {thumbUrl ? (
+//         <img src={thumbUrl} alt="" className="mb-2 h-32 w-full rounded-lg object-cover" />
+//       ) : (
+//         <div className="mb-2 h-32 w-full rounded-lg bg-[#F1EFE8]" />
+//       )}
 
-      {guide ? (
-        <div className="space-y-1">
-          <p className="text-xs text-[#888780]">
-            Guide: <span className="font-medium text-[#1a1a1a]">{guide.guide_type}</span>
-          </p>
-          <img src={guide.image_url} alt="Annotation guide" className="w-full rounded-lg" />
-        </div>
-      ) : (
-        <button
-          onClick={loadGuide}
-          disabled={guideBusy || !isGuideApiConfigured()}
-          className="w-full rounded-lg border border-[#B4B2A9] py-1.5 text-xs disabled:opacity-40"
-        >
-          {guideBusy ? 'Loading guide…' : 'Load guide'}
-        </button>
-      )}
-    </div>
-  )
-}
+//       {guide ? (
+//         <div className="space-y-1">
+//           <p className="text-xs text-[#888780]">
+//             Guide: <span className="font-medium text-[#1a1a1a]">{guide.guide_type}</span>
+//           </p>
+//           <img src={guide.image_url} alt="Annotation guide" className="w-full rounded-lg" />
+//         </div>
+//       ) : (
+//         <button
+//           onClick={loadGuide}
+//           disabled={guideBusy || !isGuideApiConfigured()}
+//           className="w-full rounded-lg border border-[#B4B2A9] py-1.5 text-xs disabled:opacity-40"
+//         >
+//           {guideBusy ? 'Loading guide…' : 'Load guide'}
+//         </button>
+//       )}
+//     </div>
+//   )
+// }

@@ -214,18 +214,45 @@ describe('preflightCorrectionZip', () => {
     expect(result.errors[0]).toMatch(/unsupported file extension/)
   })
 
-  it('rejects unknown files in the corrections/ folder (not in manifest)', () => {
+  it('accepts a ZIP with unrecognized extra files, reporting them as skipped', () => {
     const entries = [
       ...baseEntries,
-      makeEntry('corrections/extra-file.png'), // not in manifest
+      makeEntry('corrections/extra-file.png'), // not in manifest — e.g. a mask
+      // fixed after this batch was exported, so it has no manifest row yet.
     ]
     const result = preflightCorrectionZip({
       manifestRows: baseRows,
       entries,
       expectedProjectId: 'proj-1',
     })
+    expect(result.ok).toBe(true)
+    expect(result.items).toHaveLength(1)
+    expect(result.items[0].instanceId).toBe('uuid-1')
+    expect(result.skipped).toEqual(['corrections/extra-file.png'])
+  })
+
+  it('returns an empty skipped list for a ZIP with no extra files', () => {
+    const result = preflightCorrectionZip({
+      manifestRows: baseRows,
+      entries: baseEntries,
+      expectedProjectId: 'proj-1',
+    })
+    expect(result.ok).toBe(true)
+    expect(result.skipped).toEqual([])
+  })
+
+  it('still reports skipped files alongside a hard rejection', () => {
+    const entries = [makeEntry('manifest.csv'), makeEntry('corrections/extra-file.png')]
+    // correction file for baseRows is missing → hard error, but the unrelated
+    // extra file should still show up as skipped, not swallowed.
+    const result = preflightCorrectionZip({
+      manifestRows: baseRows,
+      entries,
+      expectedProjectId: 'proj-1',
+    })
     expect(result.ok).toBe(false)
-    expect(result.errors[0]).toMatch(/Unknown file/)
+    expect(result.errors[0]).toMatch(/not found in ZIP/)
+    expect(result.skipped).toEqual(['corrections/extra-file.png'])
   })
 
   it('accumulates multiple errors instead of short-circuiting', () => {
