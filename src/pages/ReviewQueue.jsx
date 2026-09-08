@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import MaskOverlay from '../components/MaskOverlay'
@@ -37,6 +37,28 @@ export default function ReviewQueue() {
   const [categories, setCategories] = useState([])
   const [classColors, setClassColors] = useState({})
   const [colorPanelOpen, setColorPanelOpen] = useState(false)
+
+  // Background work in decide() (count refresh) can resolve after the user
+  // has navigated away — don't call setState on an unmounted component.
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  // Last resolved "instance X of Y" sibling list, keyed by photo. Consecutive
+  // masks in the queue are usually from the same photo (queue is created_at
+  // ordered), so most advances can read position straight out of here instead
+  // of firing another per-photo query.
+  const photoSiblingsRef = useRef({ photoId: null, ids: [] })
+
+  // loadCounts() no longer runs serialized behind `busy`, so two fast
+  // decisions can have their count fetches in flight at once. This token lets
+  // only the most recently started fetch write its result, so an out-of-order
+  // stale response can't clobber a fresher one.
+  const countsSeqRef = useRef(0)
 
   // Opacity resets every session, per your call — no persistence.
   const [opacities, setOpacities] = useState({ photo: 1, mask: 0.5, polygon: 0.35, bbox: 1 })
@@ -131,23 +153,35 @@ export default function ReviewQueue() {
 
   const loadCounts = useCallback(async () => {
     if (!userId) return
+    const seq = ++countsSeqRef.current
     // My own numbers, not the project's — exact counts, no rows fetched.
     try {
       const [mine, helpableCount] = await Promise.all([
         fetchMyQueueCounts(projectId, userId),
         fetchHelpablePendingCount(projectId, userId),
       ])
+      // Bail if we've unmounted or a newer loadCounts() started while this
+      // one was in flight — its result supersedes ours.
+      if (!mountedRef.current || seq !== countsSeqRef.current) return
       setCounts(mine)
       setHelpable(helpableCount)
     } catch (e) {
       console.error('loadCounts failed:', e)
     }
+  }, [projectId, userId])
 
-    // Categories stay project-wide: they drive the class-color picker,
-    // which is per-project config rather than anyone's personal workload.
-    // No categories table, so fetch the column and dedupe client-side.
-    // Paged: the distinct list is derived from every mask row, so a read
-    // truncated at 1000 drops whole classes out of the color picker.
+  // Split out of loadCounts on purpose: this pages through EVERY mask row in
+  // the project (1000/page) to rebuild the class-color picker's category
+  // list, and categories only ever change on upload — never on a review
+  // decision. Keeping it here meant every Yes/No press paid for a full
+  // project scan. Now it runs once per project on entering the queue.
+  //
+  // Categories stay project-wide: they drive the class-color picker, which is
+  // per-project config rather than anyone's personal workload. No categories
+  // table, so fetch the column and dedupe client-side. Paged: the distinct
+  // list is derived from every mask row, so a read truncated at 1000 drops
+  // whole classes out of the color picker.
+  const loadCategories = useCallback(async () => {
     try {
       const catData = await selectAll(
         () => supabase.from('active_masks').select('id, category').eq('project_id', projectId),
@@ -157,25 +191,41 @@ export default function ReviewQueue() {
       for (const row of catData) {
         if (row.category) cats.add(row.category)
       }
+      if (!mountedRef.current) return
       setCategories([...cats].sort())
     } catch (e) {
       console.error('category load failed:', e)
     }
-  }, [projectId, userId])
+  }, [projectId])
 
   useEffect(() => {
     loadQueue()
     loadCounts()
+  }, [loadQueue, loadCounts])
+
+  // Project-scoped config for the sidebar — reload only when the project
+  // changes, not when the queue scope (mine/helping) toggles.
+  useEffect(() => {
+    loadCategories()
     getClassColors(projectId)
       .then(setClassColors)
       .catch((e) => console.error('getClassColors failed:', e))
-  }, [loadQueue, loadCounts, projectId])
+  }, [loadCategories, projectId])
 
   // "instance X of Y" within the current photo — recomputed whenever the
   // displayed mask changes, whether that's from Prev/Next or a decision.
   useEffect(() => {
     if (!mask) {
       setPosition(null)
+      return
+    }
+    // Same photo as the last resolved lookup — derive position from the
+    // cached sibling ids, no query. Covers the common run of consecutive
+    // instances on one photo.
+    if (mask.photo_id === photoSiblingsRef.current.photoId) {
+      const ids = photoSiblingsRef.current.ids
+      const idx = ids.indexOf(mask.id)
+      setPosition({ index: idx + 1, total: ids.length })
       return
     }
     let cancelled = false
@@ -186,6 +236,7 @@ export default function ReviewQueue() {
       .order('created_at', { ascending: true })
       .then(({ data }) => {
         if (cancelled || !data) return
+        photoSiblingsRef.current = { photoId: mask.photo_id, ids: data.map((s) => s.id) }
         const idx = data.findIndex((s) => s.id === mask.id)
         setPosition({ index: idx + 1, total: data.length })
       })
@@ -221,12 +272,16 @@ export default function ReviewQueue() {
   }
 
   async function decide(status) {
-    if (!mask) return
+    if (!mask || !userId) return
     setBusy(true)
+    // Only the masks UPDATE below is awaited before the queue advances and
+    // the buttons re-enable — its returned rows are what the cross-reviewer
+    // race check needs. The audit log, the redo rebalance and the count
+    // refresh are all fired without await: none of them decides whether the
+    // decision is saved, and awaiting them in series (plus a getUser() round
+    // trip that only re-fetched the userId we already hold) was what left
+    // every Yes/No press sitting for several round trips.
     try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser()
       // assigned_to is cleared on the way out: the mask has left this
       // reviewer's stack either way. For a pass that's the end of it; for
       // a fail it drops the mask back into the unassigned redo pool so the
@@ -245,7 +300,7 @@ export default function ReviewQueue() {
         .from('masks')
         .update({
           status,
-          reviewed_by: user.id,
+          reviewed_by: userId,
           reviewed_at: new Date().toISOString(),
           assigned_to: null,
         })
@@ -262,35 +317,70 @@ export default function ReviewQueue() {
         const withoutIt = [...queue.slice(0, skipIndex), ...queue.slice(skipIndex + 1)]
         setQueue(withoutIt)
         setQueueIndex(Math.min(skipIndex, Math.max(0, withoutIt.length - 1)))
+        // It left the pool we're drawing from, but we didn't decide it — only
+        // the pending side moves (mode picks which pool, as above).
+        if (mode === 'mine') {
+          setCounts((c) => c && { ...c, pending: Math.max(0, c.pending - 1) })
+        } else {
+          setHelpable((h) => Math.max(0, h - 1))
+        }
+        loadCounts().catch((e) => console.error('loadCounts failed:', e))
         showError('Someone else already reviewed that one — skipping it.')
         return
       }
-      await supabase.from('review_logs').insert({
-        project_id: projectId,
-        mask_id: mask.id,
-        photo_id: mask.photo_id,
-        reviewer_id: user.id,
-        action: status === 'pass' ? 'confirm_pass' : 'confirm_fail',
-        status_before: 'pending',
-        status_after: status,
-      })
-      // Drop the reviewed mask from the local queue — the item that was
-      // next in line slides into this same index, so we stay put rather
-      // than jumping the view.
+
+      // Decision is saved. Drop the reviewed mask from the local queue — the
+      // item that was next in line slides into this same index, so we stay
+      // put rather than jumping the view — and let `finally` re-enable the
+      // buttons on this same tick.
       const decidedIndex = queueIndex
       const nextQueue = [...queue.slice(0, decidedIndex), ...queue.slice(decidedIndex + 1)]
       setQueue(nextQueue)
       setQueueIndex(Math.min(decidedIndex, Math.max(0, nextQueue.length - 1)))
+      // Optimistic count nudge, reconciled by the background loadCounts()
+      // below — this just keeps the header and the "N of M" nav label exact
+      // in the meantime instead of reading one high. pass/fail count by
+      // reviewed_by, so they move in either mode. The pending pool that
+      // shrinks depends on which queue this is: my own assigned count in
+      // 'mine', the shared helpable pool in 'helping' (where the mask was
+      // never in my assigned pending count to begin with).
+      setCounts(
+        (c) =>
+          c && {
+            ...c,
+            [status]: c[status] + 1,
+            ...(mode === 'mine' ? { pending: Math.max(0, c.pending - 1) } : {}),
+          },
+      )
+      if (mode === 'helping') setHelpable((h) => Math.max(0, h - 1))
+
+      // --- everything below is background work; none of it is awaited, so
+      //     the buttons are already live again by the time it runs ---
+
+      supabase
+        .from('review_logs')
+        .insert({
+          project_id: projectId,
+          mask_id: mask.id,
+          photo_id: mask.photo_id,
+          reviewer_id: userId,
+          action: status === 'pass' ? 'confirm_pass' : 'confirm_fail',
+          status_before: 'pending',
+          status_after: status,
+        })
+        .then(({ error }) => {
+          // A lost audit row is tolerable (skipMask is fire-and-forget too);
+          // don't interrupt the reviewer over it.
+          if (error) console.error('review_logs insert failed:', error)
+        })
 
       // Route the mask we just failed to someone for re-annotation. Only
       // the fail path needs this, and only the one now-unassigned row is
-      // in play, so it's a cheap call. Non-fatal: the decision itself is
-      // already saved, and the next rebalance would pick the mask up
-      // anyway — it just wouldn't appear in anyone's My Redo until then.
+      // in play. Non-fatal: the decision itself is already saved, and the
+      // next rebalance would pick the mask up anyway — it just wouldn't
+      // appear in anyone's My Redo until then.
       if (status === 'fail') {
-        try {
-          await rebalanceAssignments(projectId, 'fail')
-        } catch (e) {
+        rebalanceAssignments(projectId, 'fail').catch((e) => {
           // Surfaced, not just logged: the decision is saved either way, but
           // the mask is now sitting unassigned in nobody's My Redo while the
           // dashboard still counts it. Silently swallowing that made the gap
@@ -299,10 +389,10 @@ export default function ReviewQueue() {
           showError(
             'Saved the fail, but could not hand it out for re-annotation — a lead can press “Distribute unassigned work” on the Members page.',
           )
-        }
+        })
       }
 
-      await loadCounts()
+      loadCounts().catch((e) => console.error('loadCounts failed:', e))
     } catch (e) {
       console.error('decide failed:', e)
       showError('Could not save that decision — please try again.')
