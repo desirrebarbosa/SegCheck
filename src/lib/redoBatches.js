@@ -1,6 +1,7 @@
 import { supabase } from './supabaseClient'
 import { selectAll, IN_CHUNK } from './paging'
 import { distributeEvenly } from './redoDistribution'
+import { fetchRedoLoad } from './redoLoad'
 
 // Redo BATCHES: the record of what someone has actually downloaded.
 //
@@ -198,9 +199,13 @@ export async function relevelRedo(projectId) {
 
   // Deal the whole free pool across EVERY member, including anyone holding an
   // open batch. Their surviving load is exactly what is locked in that batch,
-  // and seeding it means distributeEvenly levels TOTALS: someone already
-  // holding 969 is topped up to the same total as everyone else rather than
-  // being handed a full share on top, or skipped entirely.
+  // and seeding it means distributeEvenly levels TOTALS rather than handing
+  // them a full share on top, or skipping them entirely.
+  //
+  // The total being levelled is held + corrections already submitted, so this
+  // is what actually corrects a skewed backlog: whoever has done less of the
+  // work absorbs the pool. rebalanceAssignments cannot do it, because it only
+  // ever deals masks nobody holds — see seedLoad() in redoDistribution.js.
   const pool = (
     await selectAll(
       () =>
@@ -215,19 +220,7 @@ export async function relevelRedo(projectId) {
     )
   ).filter((m) => activeFail.has(m.id))
 
-  const load = new Map(participants.map((id) => [id, 0]))
-  await Promise.all(
-    participants.map(async (id) => {
-      const { count, error } = await supabase
-        .from('active_masks')
-        .select('id', { count: 'exact', head: true })
-        .eq('project_id', projectId)
-        .eq('status', 'fail')
-        .eq('assigned_to', id)
-      if (error) throw error
-      load.set(id, count ?? 0)
-    }),
-  )
+  const load = await fetchRedoLoad(projectId, participants)
 
   const byReviewer = distributeEvenly(
     pool.map((m) => m.id),
