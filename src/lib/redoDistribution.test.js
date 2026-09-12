@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { distributeEvenly } from './redoDistribution'
+import { distributeEvenly, seedLoad } from './redoDistribution'
 
 // Covers the redo auto-distribution rule: the unassigned pool is handed
 // out so that TOTAL per-member load ends up as level as possible, without
@@ -74,5 +74,67 @@ describe('distributeEvenly', () => {
     const current = load({ a: 1, b: 0 })
     distributeEvenly(['m1', 'm2', 'm3'], current)
     expect(Object.fromEntries(current)).toEqual({ a: 2, b: 2 })
+  })
+})
+
+// Covers the fairness rule layered on top for the REDO pool: what gets
+// levelled is total redo throughput (finished + holding), not outstanding
+// count. Without it the split comes out equal between people no matter how
+// much each has actually done.
+describe('seedLoad', () => {
+  const counts = (obj) => new Map(Object.entries(obj))
+
+  it('adds corrections already submitted to what a member is holding', () => {
+    const seed = seedLoad(['ana', 'ben'], counts({ ana: 40, ben: 40 }), counts({ ana: 300, ben: 20 }))
+    expect(Object.fromEntries(seed)).toEqual({ ana: 340, ben: 60 })
+  })
+
+  it('leaves a heavy contributor out of the deal until the others catch up', () => {
+    // The case this whole rule exists for. Equal outstanding (40 each) but
+    // wildly unequal work done, so a fair split of 100 is NOT 50/50.
+    const seed = seedLoad(['ana', 'ben'], counts({ ana: 40, ben: 40 }), counts({ ana: 300, ben: 20 }))
+    const result = distributeEvenly(
+      Array.from({ length: 100 }, (_, i) => `m${i}`),
+      seed,
+    )
+    expect(result.get('ben')).toHaveLength(100)
+    expect(result.has('ana')).toBe(false)
+  })
+
+  it('splits evenly again once totals have converged', () => {
+    // Self-correcting rather than a permanent handicap: equal credit and
+    // equal load behaves exactly as it did before credit existed.
+    const seed = seedLoad(['ana', 'ben'], counts({ ana: 10, ben: 10 }), counts({ ana: 50, ben: 50 }))
+    const result = distributeEvenly(['m1', 'm2', 'm3', 'm4'], seed)
+    expect(result.get('ana')).toHaveLength(2)
+    expect(result.get('ben')).toHaveLength(2)
+  })
+
+  it('damps the credit when creditWeight is below 1', () => {
+    // The tuning knob: half credit lightens a contributor's share without
+    // taking them out of the deal entirely.
+    const seed = seedLoad(['ana', 'ben'], counts({ ana: 0, ben: 0 }), counts({ ana: 300, ben: 20 }), 0.5)
+    expect(Object.fromEntries(seed)).toEqual({ ana: 150, ben: 10 })
+  })
+
+  it('restores plain outstanding-count levelling at creditWeight 0', () => {
+    const seed = seedLoad(['ana', 'ben'], counts({ ana: 40, ben: 40 }), counts({ ana: 300, ben: 20 }), 0)
+    const result = distributeEvenly(['m1', 'm2', 'm3', 'm4'], seed)
+    expect(result.get('ana')).toHaveLength(2)
+    expect(result.get('ben')).toHaveLength(2)
+  })
+
+  it('follows memberIds order, not the order the counts arrive in', () => {
+    // distributeEvenly breaks ties by Map iteration order, so this is what
+    // keeps the same inputs producing the same split run to run.
+    const seed = seedLoad(['a', 'b', 'c'], counts({ c: 1, a: 1, b: 1 }), counts({ b: 0, c: 0, a: 0 }))
+    expect([...seed.keys()]).toEqual(['a', 'b', 'c'])
+  })
+
+  it('treats a member missing from either count as zero', () => {
+    // A brand-new member has no held rows and no corrections, so neither
+    // count query returns an entry for them.
+    const seed = seedLoad(['veteran', 'newcomer'], counts({ veteran: 5 }), counts({ veteran: 100 }))
+    expect(Object.fromEntries(seed)).toEqual({ veteran: 105, newcomer: 0 })
   })
 })

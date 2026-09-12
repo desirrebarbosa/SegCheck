@@ -112,7 +112,9 @@ export default function Members() {
         message:
           'Work that has been downloaded stays with whoever has it. Everything ' +
           'else is released and re-split so every member ends up with the same ' +
-          'total — including anyone mid-batch, who is topped up to match.',
+          'total of fixed + outstanding — so anyone well ahead on corrections ' +
+          'may come out with little or nothing, and anyone behind with more. ' +
+          'Members mid-batch take part too, topped up against that same total.',
         confirmLabel: 'Re-level',
       }))
     )
@@ -193,9 +195,11 @@ export default function Members() {
     <section className="max-w-xl">
       <h2 className="text-lg font-medium">Members</h2>
       <p className="mt-1 text-sm text-[#888780]">
-        Review and redo work is split evenly by count across everyone here — no manual
-        assignment needed. Each member sees only their own share, but everyone&rsquo;s
-        progress is visible below.
+        Review work is split evenly across everyone here. Redo work counts what
+        each member has already fixed toward their share, so whoever is further
+        behind gets more of it — nobody is topped back up to match someone who
+        has already done the work. No manual assignment needed; each member sees
+        only their own share, but everyone&rsquo;s progress is visible below.
       </p>
 
       <form onSubmit={handleAdd} className="mt-4 flex gap-2">
@@ -299,13 +303,15 @@ export default function Members() {
 // One member's numbers. Split into "still on their plate" and "already
 // done" because they answer different questions — the first is whether to
 // give them more work, the second is whether they are actually working.
-// Zeroes are rendered rather than hidden: a member with 0 outstanding and
-// 0 done needs to look different from one who has cleared their queue, and
-// the old "hide when zero" badge made those two identical.
-// Outstanding work only — what this member still has on their plate.
+//
+// `fixed` is not decoration here. It is an INPUT to the redo split, so it is
+// the only thing on this page that explains why two members can sit at
+// different "to redo" counts — without it an intentionally uneven split
+// reads as a bug.
 //
 // Zeroes are rendered rather than hidden: a member who has cleared their
-// queue and one who was never given anything need to look different.
+// queue and one who was never given anything need to look different, and the
+// old "hide when zero" badge made those two identical.
 function MemberProgress({ p, loading }) {
   if (loading) return <p className="mt-1 text-xs text-[#B4B2A9]">Loading progress…</p>
   if (!p) return null
@@ -313,6 +319,7 @@ function MemberProgress({ p, loading }) {
     <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
       <Metric value={p.pending} label="to review" />
       <Metric value={p.redo} label="to redo" tone="danger" />
+      <Metric value={p.corrected} label="fixed" tone="success" />
     </div>
   )
 }

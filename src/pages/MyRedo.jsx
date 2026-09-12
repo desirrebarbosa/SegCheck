@@ -307,8 +307,17 @@ export default function MyRedo() {
       )}
 
       {items === null && <p className="mt-6 text-sm text-[#888780]">Loading…</p>}
+      {/* An empty queue now has two quite different meanings. Redo is dealt
+          against fixed + outstanding, so someone who is ahead on corrections
+          is meant to get nothing until the others catch up. Saying only
+          "nothing assigned" would read as work having gone missing. */}
       {items?.length === 0 && (
-        <p className="mt-6 text-sm text-[#888780]">Nothing assigned to you right now.</p>
+        <p className="mt-6 text-sm text-[#888780]">
+          Nothing assigned to you right now.
+          {correctionCount > 0 &&
+            ' You are ahead — redo is shared out against what each member has' +
+              ' already fixed, so the next batch goes to whoever is further behind.'}
+        </p>
       )}
 
       {/* <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">

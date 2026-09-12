@@ -1,5 +1,6 @@
 import { supabase } from './supabaseClient'
 import { distributeEvenly } from './redoDistribution'
+import { fetchRedoLoad, fetchCorrectionCount } from './redoLoad'
 import { selectAll } from './paging'
 
 // All queries below are further constrained by RLS, so they only ever return
@@ -118,8 +119,15 @@ export async function listMembers(projectId) {
 // versions stay assigned but render nowhere, so counting them would show a
 // member more outstanding work than they can actually see.
 //
+// `corrected` is lifetime corrections submitted, read from mask_corrections
+// (not active_masks) because submitting clears assigned_to. It is on this
+// page because it is now an INPUT to the redo split, not just a progress
+// number: it is what explains why two members can show different `redo`
+// counts. Deliberately not version-filtered — work done stays done even if
+// the photo was later superseded.
+//
 // Count-only (`head: true`, no rows returned), run in parallel — the same
-// shape as the load counts in rebalanceAssignments. Two small requests per
+// shape as the load counts in rebalanceAssignments. Three small requests per
 // member; if a roster ever grows past a few dozen people this wants a SQL
 // view instead.
 export async function fetchMemberProgress(projectId, reviewerIds) {
@@ -136,11 +144,12 @@ export async function fetchMemberProgress(projectId, reviewerIds) {
 
   const entries = await Promise.all(
     reviewerIds.map(async (id) => {
-      const [pending, redo] = await Promise.all([
+      const [pending, redo, corrected] = await Promise.all([
         countMasks(id, 'pending'),
         countMasks(id, 'fail'),
+        fetchCorrectionCount(projectId, id),
       ])
-      return [id, { pending, redo }]
+      return [id, { pending, redo, corrected }]
     }),
   )
 
@@ -265,19 +274,34 @@ export async function rebalanceAssignments(projectId, status) {
   // and these counts resolve in whatever order the network returns them.
   // distributeEvenly breaks ties by iteration order, so seeding keeps the
   // split deterministic instead of varying run to run.
-  const load = new Map(members.map((m) => [m.reviewer_id, 0]))
-  await Promise.all(
-    members.map(async (m) => {
-      const { count, error } = await supabase
-        .from('active_masks')
-        .select('id', { count: 'exact', head: true })
-        .eq('project_id', projectId)
-        .eq('status', status)
-        .eq('assigned_to', m.reviewer_id)
-      if (error) throw error
-      load.set(m.reviewer_id, count ?? 0)
-    }),
-  )
+  //
+  // REDO ('fail') additionally credits each member for the corrections they
+  // have already submitted, so someone who has done more of the work is not
+  // topped back up to the same outstanding count as someone who has done far
+  // less — see seedLoad() in redoDistribution.js. REVIEW ('pending') keeps
+  // levelling plain outstanding count: reviewing is the step that unblocks
+  // everything else, so it stays split evenly regardless of contribution.
+  // Checked explicitly rather than defaulted, so a third assignable status
+  // added later cannot silently inherit redo's credit rule.
+  const memberIds = members.map((m) => m.reviewer_id)
+  let load
+  if (status === 'fail') {
+    load = await fetchRedoLoad(projectId, memberIds)
+  } else {
+    load = new Map(memberIds.map((id) => [id, 0]))
+    await Promise.all(
+      memberIds.map(async (id) => {
+        const { count, error } = await supabase
+          .from('active_masks')
+          .select('id', { count: 'exact', head: true })
+          .eq('project_id', projectId)
+          .eq('status', status)
+          .eq('assigned_to', id)
+        if (error) throw error
+        load.set(id, count ?? 0)
+      }),
+    )
+  }
 
   const byReviewer = distributeEvenly(
     unassigned.map((m) => m.id),
@@ -384,17 +408,11 @@ export async function fetchMyRedoAssignments(projectId, reviewerId) {
 }
 
 // Total corrections this reviewer has successfully submitted for this
-// project. Reads mask_corrections rather than active_masks/masks because a
-// correction's mask has assigned_to cleared on submit (see
-// submit_corrections) — mask_corrections is the durable record.
+// project, for the My Redo header. Thin wrapper over fetchCorrectionCount —
+// the same number feeds the redo split as each member's credit, and the two
+// must never disagree about what counts as work done.
 export async function fetchMyCorrectionCount(projectId, reviewerId) {
-  const { count, error } = await supabase
-    .from('mask_corrections')
-    .select('id', { count: 'exact', head: true })
-    .eq('project_id', projectId)
-    .eq('submitted_by', reviewerId)
-  if (error) throw error
-  return count ?? 0
+  return fetchCorrectionCount(projectId, reviewerId)
 }
 
 // Remove a member from a project. Gated to owner-only in the UI (RLS also
